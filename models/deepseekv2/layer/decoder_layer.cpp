@@ -150,7 +150,13 @@ std::map<std::string, std::vector<std::string>> GetDeepseekV2LayerInTensorCandid
 	{"indexer_intensor", {
             "in_k_cache_indexer", "in_seq_len_query"}},
         {"topk_share", {
-            "in_shared_topk_indices"}}
+            "in_shared_topk_indices"}},
+        {"decode_dcp", {
+            "in_dcp_selected_cache_buffer", "in_dcp_topk_buffer",
+            "in_dcp_logical_block_lut", "in_dcp_block_offset_lut",
+            "in_dcp_packed_gather_indices", "in_dcp_packed_query_block_rows",
+            "in_dcp_actual_seq_lengths_query", "in_dcp_actual_seq_lengths_key",
+            "in_dcp_identity_topk"}}
     };
     SetDeepseekV2LayerInTensorDefaultCandidates(deepseekV2LayerInTensorCandidates);
     return deepseekV2LayerInTensorCandidates;
@@ -275,6 +281,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(
     }
     if (param.skipTopk) {
         atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "topk_share", inTensorList);
+    }
+    if (param.enableDecodeDcpLayerOwner) {
+        atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "decode_dcp", inTensorList);
     }
     if (param.mapping.Get(base::ATTN_CP).IsEnabled() && param.isPrefill) {
         if (param.index_n_heads > 0) {
@@ -477,6 +486,29 @@ atb::Status SetLatentAttentionParam(
     latentAttentionParam.index_topk = param.index_topk;
     latentAttentionParam.skipTopk = param.skipTopk;
     latentAttentionParam.outputTopk = param.outputTopk;
+    latentAttentionParam.enableDecodeDcpLayerOwner =
+        param.enableDecodeDcpLayerOwner;
+    latentAttentionParam.decodeDcpBlockSize = param.decodeDcpBlockSize;
+    if (param.enableDecodeDcpLayerOwner) {
+        CHECK(param.mapping.Has(base::ATTN_DECODE_DCP))
+            << "Decode DCP mapping is missing.";
+        latentAttentionParam.decodeDcpInfo =
+            param.mapping.Get(base::ATTN_DECODE_DCP);
+        CHECK(!latentAttentionParam.decodeDcpInfo.rankIds.empty())
+            << "Decode DCP group must not be empty.";
+        const int32_t decodeDcpSize = static_cast<int32_t>(
+            latentAttentionParam.decodeDcpInfo.rankIds.size());
+        CHECK_GT(decodeDcpSize, 1)
+            << "Decode DCP group must contain more than one rank.";
+        CHECK_LT(latentAttentionParam.decodeDcpInfo.rank,
+            static_cast<uint32_t>(decodeDcpSize));
+        CHECK_GT(latentAttentionParam.decodeDcpBlockSize, 0);
+        latentAttentionParam.decodeDcpOwnerRank =
+            param.layerId % decodeDcpSize;
+        latentAttentionParam.isDecodeDcpOwner =
+            latentAttentionParam.decodeDcpInfo.rank ==
+            static_cast<uint32_t>(latentAttentionParam.decodeDcpOwnerRank);
+    }
     latentAttentionParam.selfAttentionParam.headNum = param.numAttentionHeadsPerRank;
     latentAttentionParam.selfAttentionParam.kvHeadNum = param.numAttentionHeadsPerRank;
     CHECK_PARAM_GT(param.hiddenSizePerAttentionHead, 0);
@@ -595,6 +627,10 @@ int64_t SetAttention(atb::GraphParam &opGraph, const DecoderLayerParam &param,
     }
     if (param.skipTopk) {
         atb_speed::common::AddTensorToList(GetDeepseekV2LayerInTensorCandidates(), "topk_share", attnInTensorNames);
+    }
+    if (param.enableDecodeDcpLayerOwner) {
+        atb_speed::common::AddTensorToList(
+            GetDeepseekV2LayerInTensorCandidates(), "decode_dcp", attnInTensorNames);
     }
     if (param.enablePrefixCache) {
         atb_speed::common::AddTensorToList(GetDeepseekV2LayerInTensorCandidates(), "prefixcache", attnInTensorNames);
@@ -2007,8 +2043,7 @@ atb::Status DecoderLayer(DecoderLayerParam &param, atb::Operation **operation)
             outTensorDescs.at(topkOutIdx).shape.dimNum = 3;
             outTensorDescs.at(topkOutIdx).shape.dims[0] = inTensorDescs.at(
                 atb_speed::common::GetTensorIdx(tensorMap, "in_hidden_states")).shape.dims[0];
-            outTensorDescs.at(topkOutIdx).shape.dims[1] = inTensorDescs.at(
-                atb_speed::common::GetTensorIdx(tensorMap, "in_k_cache_indexer")).shape.dims[2];
+            outTensorDescs.at(topkOutIdx).shape.dims[1] = 1;
             outTensorDescs.at(topkOutIdx).shape.dims[2] = param.index_topk;
         }
         return atb::NO_ERROR;

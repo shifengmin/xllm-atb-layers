@@ -73,6 +73,10 @@ public:
     int index_topk = 0; // 2048
     bool skipTopk = false;
     bool outputTopk = false;
+    // Decode layer-owner context parallelism. The owner role is static for a
+    // layer and is resolved from ATTN_DECODE_DCP during graph construction.
+    bool enableDecodeDcpLayerOwner = false;
+    int decodeDcpBlockSize = 0;
     // translated
     int attnStreamNum = 1;
     int ffnStreamNum = 1;

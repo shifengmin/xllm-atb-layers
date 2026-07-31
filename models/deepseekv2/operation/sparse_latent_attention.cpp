@@ -143,6 +143,12 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnInTensorCandidates(
         {"qkvdown_dp", {"in_ffn_unpadding_idx"}
         },
         {"topk_share", {"in_shared_topk_indices"}},
+        {"decode_dcp", {
+            "in_dcp_selected_cache_buffer", "in_dcp_topk_buffer",
+            "in_dcp_logical_block_lut", "in_dcp_block_offset_lut",
+            "in_dcp_packed_gather_indices", "in_dcp_packed_query_block_rows",
+            "in_dcp_actual_seq_lengths_query", "in_dcp_actual_seq_lengths_key",
+            "in_dcp_identity_topk"}},
         {"cp_prefixcache", {
             "in_prefix_slots"
         }},
@@ -237,6 +243,19 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
         {"cp_prefixcache_allgather_indexer", {
             "prefix_indexer_k_allgather"
         }},
+        {"decode_dcp", {
+            "dcp_selected_cache", "dcp_selected_latent", "dcp_selected_rope"
+        }},
+        {"decode_dcp_internal_topk", {"dcp_topk"}},
+        {"decode_dcp_owner", {
+            "dcp_valid_logical_positions",
+            "dcp_logical_blocks", "dcp_block_offsets",
+            "dcp_block_table_rows", "dcp_physical_blocks",
+            "dcp_physical_slots_scaled", "dcp_physical_slots",
+            "dcp_selected_latent_local", "dcp_selected_rope_local",
+            "dcp_selected_cache_local"
+        }},
+        {"decode_dcp_owner_topk", {"dcp_raw_topk"}},
     };
     return latentAttnIntermediateTensorCandidates;
 }
@@ -301,13 +320,32 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
             AddTensorToList(latentAttnIntermediateTensorCandidates, "decode", intermediateTensorList);
         }
     }
-    if (!param.skipTopk) {
+    const bool buildsLocalIndexer =
+        !param.enableDecodeDcpLayerOwner || param.isDecodeDcpOwner;
+    if (!param.skipTopk && buildsLocalIndexer) {
         AddTensorToList(latentAttnIntermediateTensorCandidates, "indexer", intermediateTensorList);
         if (!param.outputTopk) {
             intermediateTensorList.push_back("intermediate_topk_indices");
         }
-    } else {
+    }
+    if (param.skipTopk) {
         AddTensorToList(latentAttnInTensorCandidates, "topk_share", inTensorList);
+    }
+    if (param.enableDecodeDcpLayerOwner) {
+        AddTensorToList(latentAttnInTensorCandidates, "decode_dcp", inTensorList);
+        AddTensorToList(latentAttnIntermediateTensorCandidates, "decode_dcp", intermediateTensorList);
+        if (!param.skipTopk && !param.outputTopk) {
+            AddTensorToList(latentAttnIntermediateTensorCandidates,
+                "decode_dcp_internal_topk", intermediateTensorList);
+        }
+        if (param.isDecodeDcpOwner) {
+            AddTensorToList(latentAttnIntermediateTensorCandidates,
+                "decode_dcp_owner", intermediateTensorList);
+            if (param.outputTopk) {
+                AddTensorToList(latentAttnIntermediateTensorCandidates,
+                    "decode_dcp_owner_topk", intermediateTensorList);
+            }
+        }
     }
     AddTensorToList(latentAttnIntermediateTensorCandidates, "ein_reproj", intermediateTensorList);
     // using MATMUL_EIN_SUM, skip trans
@@ -1050,6 +1088,31 @@ atb::Status AddLAttnRopeNode(const LatentAttentionParam<NormParamType> &param,
     };
     opGraph.nodes.push_back(ropeNode);
     ATB_SPEED_LOG_DEBUG("MLA rope calculation success");
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddDecodeDcpQRopeNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    atb::Node ropeQNode;
+    atb_speed::common::AclnnRopeParam ropeParam;
+    ropeParam.mode = 1;
+    ropeQNode.operation = new atb_speed::common::AclnnRopeOperation(
+        "DecodeDcpRopeQNode", ropeParam);
+    ropeQNode.inTensorIds = GetTensorIdxList(tensorMap,
+        {"rope_q", "in_cos_embed", "in_sin_embed"});
+    ropeQNode.outTensorIds = GetTensorIdxList(tensorMap, {"rope_q_o"});
+    ropeQNode.inTensorReshapeFuncs.resize(ropeQNode.inTensorIds.size());
+    for (size_t inputIdx = 0; inputIdx < ropeQNode.inTensorIds.size(); ++inputIdx) {
+        ropeQNode.inTensorReshapeFuncs[inputIdx] =
+            [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+                UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
+            };
+    }
+    opGraph.nodes.push_back(ropeQNode);
     return atb::NO_ERROR;
 }
 
@@ -1874,6 +1937,7 @@ atb::Status AddLightIndexerNode(const LatentAttentionParam<NormParamType> &param
 {
     atb::Node lightIndexerNode;
     atb_speed::common::LightningIndexerParam lightIndexerParam;
+    lightIndexerParam.selectedCount = param.index_topk;
     lightIndexerNode.operation = new atb_speed::common::LightningIndexerOperation(
         "AclNNLightningIndexerNode", lightIndexerParam
     );
@@ -1885,11 +1949,250 @@ atb::Status AddLightIndexerNode(const LatentAttentionParam<NormParamType> &param
         GetTensorIdx(tensorMap, "in_seq_len"),
         GetTensorIdx(tensorMap, "in_block_tables"),
     };
-    lightIndexerNode.outTensorIds = {GetTensorIdx(
-        tensorMap,
-        param.outputTopk ? "out_topk_indices" : "intermediate_topk_indices")};
+    std::string topkOutput = "intermediate_topk_indices";
+    if (param.enableDecodeDcpLayerOwner && param.outputTopk) {
+        topkOutput = "dcp_raw_topk";
+    } else if (param.outputTopk) {
+        topkOutput = "out_topk_indices";
+    }
+    lightIndexerNode.outTensorIds = {GetTensorIdx(tensorMap, topkOutput)};
     opGraph.nodes.push_back(lightIndexerNode);
     ATB_SPEED_LOG_DEBUG("LightningIndexer calculation success");
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddDecodeDcpBroadcastNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap,
+    const std::string &input,
+    const std::string &output)
+{
+    atb::Node broadcastNode;
+    atb::infer::BroadcastParam broadcastParam;
+    broadcastParam.rank = param.decodeDcpInfo.rank;
+    broadcastParam.rankSize =
+        static_cast<uint32_t>(param.decodeDcpInfo.rankIds.size());
+    broadcastParam.rankRoot =
+        static_cast<uint32_t>(param.decodeDcpOwnerRank);
+    broadcastParam.backend = param.decodeDcpInfo.defaultBackend;
+    param.decodeDcpInfo.InitCommDomain(
+        broadcastParam.hcclComm, broadcastParam.commDomain);
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(broadcastParam, &broadcastNode.operation));
+    broadcastNode.inTensorIds = GetTensorIdxList(tensorMap, {input});
+    broadcastNode.outTensorIds = GetTensorIdxList(tensorMap, {output});
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsBeforeComm(opGraph));
+    opGraph.nodes.push_back(broadcastNode);
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsAfterComm(opGraph));
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddDecodeDcpTopkBroadcastNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    const std::string ownerSource = param.outputTopk ?
+        "dcp_raw_topk" : "intermediate_topk_indices";
+    const std::string source = param.isDecodeDcpOwner ?
+        ownerSource : "in_dcp_topk_buffer";
+    const std::string output = param.outputTopk ?
+        "out_topk_indices" : "dcp_topk";
+    return AddDecodeDcpBroadcastNode(
+        param, opGraph, tensorMap, source, output);
+}
+
+template <typename NormParamType>
+atb::Status AddDecodeDcpSelectedCacheOwnerNodes(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    const std::string topkSource = param.skipTopk ?
+        "in_shared_topk_indices" :
+        (param.outputTopk ? "out_topk_indices" : "dcp_topk");
+
+    atb::Node compactTopkNode;
+    atb::infer::GatherParam compactTopkParam;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(compactTopkParam, &compactTopkNode.operation));
+    compactTopkNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {topkSource, "in_dcp_packed_gather_indices"});
+    compactTopkNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_valid_logical_positions"});
+    compactTopkNode.inTensorReshapeFuncs.resize(
+        compactTopkNode.inTensorIds.size());
+    compactTopkNode.inTensorReshapeFuncs[0] =
+        [](const atb::Dims &oldShape, atb::Dims &newShape) {
+            newShape.dimNum = 1;
+            newShape.dims[0] = 1;
+            for (uint32_t dim = 0; dim < oldShape.dimNum; ++dim) {
+                newShape.dims[0] *= oldShape.dims[dim];
+            }
+        };
+    opGraph.nodes.push_back(compactTopkNode);
+
+    for (const auto &lutTensor : {
+             std::make_pair(std::string("in_dcp_logical_block_lut"),
+                            std::string("dcp_logical_blocks")),
+             std::make_pair(std::string("in_dcp_block_offset_lut"),
+                            std::string("dcp_block_offsets"))}) {
+        atb::Node lutGatherNode;
+        atb::infer::GatherParam lutGatherParam;
+        CHECK_OPERATION_STATUS_RETURN(
+            atb::CreateOperation(lutGatherParam, &lutGatherNode.operation));
+        lutGatherNode.inTensorIds = GetTensorIdxList(
+            tensorMap, {lutTensor.first, "dcp_valid_logical_positions"});
+        lutGatherNode.outTensorIds = GetTensorIdxList(
+            tensorMap, {lutTensor.second});
+        opGraph.nodes.push_back(lutGatherNode);
+    }
+
+    atb::Node blockTableRowsNode;
+    atb::infer::GatherParam blockTableRowsParam;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(
+        blockTableRowsParam, &blockTableRowsNode.operation));
+    blockTableRowsNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"in_block_tables", "in_dcp_packed_query_block_rows"});
+    blockTableRowsNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_block_table_rows"});
+    opGraph.nodes.push_back(blockTableRowsNode);
+
+    atb::Node physicalBlockNode;
+    atb::infer::GatherParam physicalBlockParam;
+    physicalBlockParam.axis = 1;
+    physicalBlockParam.batchDims = 1;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(
+        physicalBlockParam, &physicalBlockNode.operation));
+    physicalBlockNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_block_table_rows", "dcp_logical_blocks"});
+    physicalBlockNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_physical_blocks"});
+    opGraph.nodes.push_back(physicalBlockNode);
+
+    atb::Node scalePhysicalBlockNode;
+    atb::infer::ElewiseParam scalePhysicalBlockParam;
+    scalePhysicalBlockParam.elewiseType =
+        atb::infer::ElewiseParam::ElewiseType::ELEWISE_MULS;
+    scalePhysicalBlockParam.mulsParam.varAttr = param.decodeDcpBlockSize;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(
+        scalePhysicalBlockParam, &scalePhysicalBlockNode.operation));
+    scalePhysicalBlockNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_physical_blocks"});
+    scalePhysicalBlockNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_physical_slots_scaled"});
+    opGraph.nodes.push_back(scalePhysicalBlockNode);
+
+    atb::Node physicalSlotNode;
+    atb::infer::ElewiseParam physicalSlotParam;
+    physicalSlotParam.elewiseType =
+        atb::infer::ElewiseParam::ElewiseType::ELEWISE_ADD;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(physicalSlotParam, &physicalSlotNode.operation));
+    physicalSlotNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_physical_slots_scaled", "dcp_block_offsets"});
+    physicalSlotNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_physical_slots"});
+    opGraph.nodes.push_back(physicalSlotNode);
+
+    for (const auto &cacheTensor : {
+             std::make_pair(std::string("in_k_cache"),
+                            std::string("dcp_selected_latent_local")),
+             std::make_pair(std::string("in_k_rope_cache"),
+                            std::string("dcp_selected_rope_local"))}) {
+        atb::Node cacheGatherNode;
+        atb::infer::GatherParam cacheGatherParam;
+        CHECK_OPERATION_STATUS_RETURN(
+            atb::CreateOperation(cacheGatherParam, &cacheGatherNode.operation));
+        cacheGatherNode.inTensorIds = GetTensorIdxList(
+            tensorMap, {cacheTensor.first, "dcp_physical_slots"});
+        cacheGatherNode.outTensorIds = GetTensorIdxList(
+            tensorMap, {cacheTensor.second});
+        cacheGatherNode.inTensorReshapeFuncs.resize(
+            cacheGatherNode.inTensorIds.size());
+        cacheGatherNode.inTensorReshapeFuncs[0] =
+            [](const atb::Dims &oldShape, atb::Dims &newShape) {
+                newShape.dimNum = 3;
+                newShape.dims[0] = oldShape.dims[0] * oldShape.dims[1];
+                newShape.dims[1] = oldShape.dims[2];
+                newShape.dims[2] = oldShape.dims[3];
+            };
+        opGraph.nodes.push_back(cacheGatherNode);
+    }
+
+    atb::Node concatSelectedCacheNode;
+    atb::infer::ConcatParam concatSelectedCacheParam;
+    concatSelectedCacheParam.concatDim = 2;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(
+        concatSelectedCacheParam, &concatSelectedCacheNode.operation));
+    concatSelectedCacheNode.inTensorIds = GetTensorIdxList(
+        tensorMap,
+        {"dcp_selected_latent_local", "dcp_selected_rope_local"});
+    concatSelectedCacheNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_selected_cache_local"});
+    opGraph.nodes.push_back(concatSelectedCacheNode);
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddDecodeDcpSelectedCacheBroadcastNodes(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    const std::string source = param.isDecodeDcpOwner ?
+        "dcp_selected_cache_local" : "in_dcp_selected_cache_buffer";
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpBroadcastNode(
+        param, opGraph, tensorMap, source, "dcp_selected_cache"));
+
+    atb::Node splitSelectedCacheNode;
+    atb::infer::SplitParam splitSelectedCacheParam = {
+        2, 2, {param.kvLoraRank, param.qkRopeHeadDim}};
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(
+        splitSelectedCacheParam, &splitSelectedCacheNode.operation));
+    splitSelectedCacheNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_selected_cache"});
+    splitSelectedCacheNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_selected_latent", "dcp_selected_rope"});
+    opGraph.nodes.push_back(splitSelectedCacheNode);
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddDecodeDcpSparseFlashAttentionNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    atb::Node sparseFlashAttentionNode;
+    atb_speed::common::SparseFlashAttentionParam sparseFlashAttentionParam;
+    sparseFlashAttentionParam.queryLayout = "TND";
+    sparseFlashAttentionParam.kvLayout = "TND";
+    sparseFlashAttentionParam.scaleValue = param.softmaxScale;
+    sparseFlashAttentionParam.sparseBlockSize = 1;
+    sparseFlashAttentionParam.hasBlockTable = false;
+    sparseFlashAttentionNode.operation =
+        new atb_speed::common::SparseFlashAttentionOperation(
+            "AclNNDecodeDcpSparseFlashAttentionNode",
+            sparseFlashAttentionParam);
+    sparseFlashAttentionNode.inTensorIds = GetTensorIdxList(tensorMap, {
+        "intermediate_q_t", "dcp_selected_latent", "dcp_selected_latent",
+        "in_dcp_identity_topk", "in_block_tables",
+        "in_dcp_actual_seq_lengths_query", "in_dcp_actual_seq_lengths_key",
+        "rope_q_o", "dcp_selected_rope"});
+    sparseFlashAttentionNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"intermediate_self_attention"});
+    sparseFlashAttentionNode.inTensorReshapeFuncs.resize(
+        sparseFlashAttentionNode.inTensorIds.size());
+    sparseFlashAttentionNode.inTensorReshapeFuncs[7] =
+        [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+            UnSqueezeHeadNumHeadDim(
+                oldShape, newShape, param.qkRopeHeadDim);
+        };
+    opGraph.nodes.push_back(sparseFlashAttentionNode);
     return atb::NO_ERROR;
 }
 
@@ -2098,9 +2401,71 @@ atb::Status AddReprojVTransposeNode(const LatentAttentionParam<NormParamType> &p
 
 
 template <typename NormParamType>
+atb::Status PreprocessDecodeDcp(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    CHECK(!param.isPrefill);
+    CHECK(!param.enableMlaPreprocess)
+        << "Decode DCP requires the ordinary MLA preprocess path.";
+
+    CHECK_OPERATION_STATUS_RETURN(AddLAttnPreNormNode(param, opGraph, tensorMap));
+    if (param.qLoraRank > 0) {
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnQKVProjNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddSplitQKNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnQProjBNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddSplitQNode(param, opGraph, tensorMap));
+    } else {
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnQProjANode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddSplitQNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnKVAProjNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddSplitKNode(param, opGraph, tensorMap));
+    }
+
+    if (param.isDecodeDcpOwner) {
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnKVNormNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnRopeNode(param, opGraph, tensorMap));
+    } else {
+        CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpQRopeNode(param, opGraph, tensorMap));
+    }
+    CHECK_OPERATION_STATUS_RETURN(PreprocessKV(param, opGraph, tensorMap));
+
+    if (param.isDecodeDcpOwner) {
+        CHECK_OPERATION_STATUS_RETURN(AddReshapeAndCacheNode(param, opGraph, tensorMap));
+        if (!param.skipTopk) {
+            CHECK_OPERATION_STATUS_RETURN(AddLAttnQNormRecalNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerQBNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerQBSplitNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerInputNormRecalNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerKNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerKNormNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerKSplitNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerQKRopeNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerQKCatNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerKReshapeAndCacheNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerWeightNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddLightIndexerNode(param, opGraph, tensorMap));
+        }
+    }
+
+    if (!param.skipTopk) {
+        CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpTopkBroadcastNode(param, opGraph, tensorMap));
+    }
+    if (param.isDecodeDcpOwner) {
+        CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpSelectedCacheOwnerNodes(param, opGraph, tensorMap));
+    }
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpSelectedCacheBroadcastNodes(param, opGraph, tensorMap));
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
 atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
     atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
 {   
+    if (param.enableDecodeDcpLayerOwner) {
+        return PreprocessDecodeDcp(param, opGraph, tensorMap);
+    }
     const bool useMlaPreprocess = param.qLoraRank > 0 && param.enableMlaPreprocess && !param.isPrefill;
     if (useMlaPreprocess) {
         CHECK_OPERATION_STATUS_RETURN(AddMlaPreprocessV2Node(param, opGraph, tensorMap));
@@ -2291,8 +2656,10 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
     // Preprocess
     CHECK_OPERATION_STATUS_RETURN(sparse::Preprocess(param, opGraph, tensorMap));
     // PA or MLA
-    
-    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+    if (param.enableDecodeDcpLayerOwner) {
+        CHECK_OPERATION_STATUS_RETURN(
+            sparse::AddDecodeDcpSparseFlashAttentionNode(param, opGraph, tensorMap));
+    } else if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
     // CP Attention
         CHECK_OPERATION_STATUS_RETURN(sparse::AddSparseFlashAttentionCpNode(param, opGraph, tensorMap));
     }
@@ -2322,8 +2689,7 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
             outTensorDescs.at(1).dtype = ACL_INT32;
             outTensorDescs.at(1).shape.dimNum = 3;
             outTensorDescs.at(1).shape.dims[0] = inTensorDescs.at(0).shape.dims[0];
-            outTensorDescs.at(1).shape.dims[1] = inTensorDescs.at(
-                atb_speed::common::GetTensorIdx(tensorMap, "in_k_cache_indexer")).shape.dims[2];
+            outTensorDescs.at(1).shape.dims[1] = 1;
             outTensorDescs.at(1).shape.dims[2] = param.index_topk;
         }
         return atb::NO_ERROR;

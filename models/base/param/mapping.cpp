@@ -69,6 +69,19 @@ void Mapping::ParseParam(const nlohmann::json &paramJson)
         kvSplitInfo.groupId = FetchJsonParam<uint32_t>(kvSplitJson, "groupId");
         this->Register(ATTN_KV_SPLIT, kvSplitInfo);
     }
+    if (paramJson.contains("attnDecodeDcp")) {
+        atb_speed::common::ParallelInfo decodeDcpInfo =
+            atb_speed::common::ParallelInfo();
+        const nlohmann::json &decodeDcpJson = paramJson["attnDecodeDcp"];
+        decodeDcpInfo.rank = FetchJsonParam<uint32_t>(decodeDcpJson, "rank");
+        decodeDcpInfo.rankIds = FetchJsonParam<std::vector<uint32_t>>(
+            decodeDcpJson["rankIds"], "rankIds", true);
+        decodeDcpInfo.bufferSize =
+            FetchJsonParam<uint32_t>(decodeDcpJson, "bufferSize");
+        decodeDcpInfo.groupId =
+            FetchJsonParam<uint32_t>(decodeDcpJson, "groupId");
+        this->Register(ATTN_DECODE_DCP, decodeDcpInfo);
+    }
 }
 
 void Mapping::InitGlobalCommDomain(std::string defaultBackend)
