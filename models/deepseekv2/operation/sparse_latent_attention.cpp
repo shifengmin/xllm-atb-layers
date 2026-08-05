@@ -334,7 +334,7 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
     if (param.enableDecodeDcpLayerOwner) {
         AddTensorToList(latentAttnInTensorCandidates, "decode_dcp", inTensorList);
         AddTensorToList(latentAttnIntermediateTensorCandidates, "decode_dcp", intermediateTensorList);
-        if (!param.skipTopk && !param.outputTopk) {
+        if (!param.skipTopk) {
             AddTensorToList(latentAttnIntermediateTensorCandidates,
                 "decode_dcp_internal_topk", intermediateTensorList);
         }
@@ -1961,13 +1961,30 @@ atb::Status AddLightIndexerNode(const LatentAttentionParam<NormParamType> &param
     return atb::NO_ERROR;
 }
 
+atb::Status AddDecodeDcpCopyNode(
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap,
+    const std::string &input,
+    const std::string &output)
+{
+    atb::Node copyNode;
+    atb::infer::SliceParam copyParam;
+    copyParam.offsets = {0, 0, 0};
+    copyParam.size = {-1, -1, -1};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(copyParam, &copyNode.operation));
+    copyNode.inTensorIds = GetTensorIdxList(tensorMap, {input});
+    copyNode.outTensorIds = GetTensorIdxList(tensorMap, {output});
+    opGraph.nodes.push_back(copyNode);
+    return atb::NO_ERROR;
+}
+
 template <typename NormParamType>
 atb::Status AddDecodeDcpBroadcastNode(
     const LatentAttentionParam<NormParamType> &param,
     atb::GraphParam &opGraph,
     std::map<std::string, uint32_t> &tensorMap,
-    const std::string &input,
-    const std::string &output)
+    const std::string &input)
 {
     atb::Node broadcastNode;
     atb::infer::BroadcastParam broadcastParam;
@@ -1982,7 +1999,6 @@ atb::Status AddDecodeDcpBroadcastNode(
     CHECK_OPERATION_STATUS_RETURN(
         atb::CreateOperation(broadcastParam, &broadcastNode.operation));
     broadcastNode.inTensorIds = GetTensorIdxList(tensorMap, {input});
-    broadcastNode.outTensorIds = GetTensorIdxList(tensorMap, {output});
     CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsBeforeComm(opGraph));
     opGraph.nodes.push_back(broadcastNode);
     CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsAfterComm(opGraph));
@@ -1999,10 +2015,15 @@ atb::Status AddDecodeDcpTopkBroadcastNode(
         "dcp_raw_topk" : "intermediate_topk_indices";
     const std::string source = param.isDecodeDcpOwner ?
         ownerSource : "in_dcp_topk_buffer";
-    const std::string output = param.outputTopk ?
-        "out_topk_indices" : "dcp_topk";
-    return AddDecodeDcpBroadcastNode(
-        param, opGraph, tensorMap, source, output);
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpCopyNode(
+        opGraph, tensorMap, source, "dcp_topk"));
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpBroadcastNode(
+        param, opGraph, tensorMap, "dcp_topk"));
+    if (param.outputTopk) {
+        CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpCopyNode(
+            opGraph, tensorMap, "dcp_topk", "out_topk_indices"));
+    }
+    return atb::NO_ERROR;
 }
 
 template <typename NormParamType>
@@ -2012,8 +2033,7 @@ atb::Status AddDecodeDcpSelectedCacheOwnerNodes(
     std::map<std::string, uint32_t> &tensorMap)
 {
     const std::string topkSource = param.skipTopk ?
-        "in_shared_topk_indices" :
-        (param.outputTopk ? "out_topk_indices" : "dcp_topk");
+        "in_shared_topk_indices" : "dcp_topk";
 
     atb::Node compactTopkNode;
     atb::infer::GatherParam compactTopkParam;
@@ -2145,8 +2165,10 @@ atb::Status AddDecodeDcpSelectedCacheBroadcastNodes(
 {
     const std::string source = param.isDecodeDcpOwner ?
         "dcp_selected_cache_local" : "in_dcp_selected_cache_buffer";
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpCopyNode(
+        opGraph, tensorMap, source, "dcp_selected_cache"));
     CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpBroadcastNode(
-        param, opGraph, tensorMap, source, "dcp_selected_cache"));
+        param, opGraph, tensorMap, "dcp_selected_cache"));
 
     atb::Node splitSelectedCacheNode;
     atb::infer::SplitParam splitSelectedCacheParam = {
@@ -2694,7 +2716,18 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
         }
         return atb::NO_ERROR;
     };
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(opGraph, operation));
+    const atb::Status status = atb::CreateOperation(opGraph, operation);
+    if (status != atb::NO_ERROR) {
+        ATB_SPEED_LOG_ERROR("Failed to create SparseAttention graph, status=" << status
+            << ", isPrefill=" << param.isPrefill
+            << ", layerId=" << param.layerId
+            << ", isDecodeDcpOwner=" << param.isDecodeDcpOwner
+            << ", inTensorNum=" << opGraph.inTensorNum
+            << ", outTensorNum=" << opGraph.outTensorNum
+            << ", internalTensorNum=" << opGraph.internalTensorNum
+            << ", nodeNum=" << opGraph.nodes.size());
+        return status;
+    }
     return atb::NO_ERROR;
 }
 
