@@ -251,7 +251,9 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
             "dcp_valid_logical_positions",
             "dcp_logical_blocks", "dcp_block_offsets",
             "dcp_block_table_rows", "dcp_physical_blocks",
-            "dcp_physical_slots_scaled", "dcp_physical_slots",
+            "dcp_physical_blocks_fp32", "dcp_block_offsets_fp32",
+            "dcp_physical_slots_scaled", "dcp_physical_slots_fp32",
+            "dcp_physical_slots",
             "dcp_selected_latent_local", "dcp_selected_rope_local",
             "dcp_selected_cache_local"
         }},
@@ -1088,31 +1090,6 @@ atb::Status AddLAttnRopeNode(const LatentAttentionParam<NormParamType> &param,
     };
     opGraph.nodes.push_back(ropeNode);
     ATB_SPEED_LOG_DEBUG("MLA rope calculation success");
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddDecodeDcpQRopeNode(
-    const LatentAttentionParam<NormParamType> &param,
-    atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node ropeQNode;
-    atb_speed::common::AclnnRopeParam ropeParam;
-    ropeParam.mode = 1;
-    ropeQNode.operation = new atb_speed::common::AclnnRopeOperation(
-        "DecodeDcpRopeQNode", ropeParam);
-    ropeQNode.inTensorIds = GetTensorIdxList(tensorMap,
-        {"rope_q", "in_cos_embed", "in_sin_embed"});
-    ropeQNode.outTensorIds = GetTensorIdxList(tensorMap, {"rope_q_o"});
-    ropeQNode.inTensorReshapeFuncs.resize(ropeQNode.inTensorIds.size());
-    for (size_t inputIdx = 0; inputIdx < ropeQNode.inTensorIds.size(); ++inputIdx) {
-        ropeQNode.inTensorReshapeFuncs[inputIdx] =
-            [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-                UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
-            };
-    }
-    opGraph.nodes.push_back(ropeQNode);
     return atb::NO_ERROR;
 }
 
@@ -2093,6 +2070,13 @@ atb::Status AddDecodeDcpSelectedCacheOwnerNodes(
         tensorMap, {"dcp_physical_blocks"});
     opGraph.nodes.push_back(physicalBlockNode);
 
+    // ATB Elewise MULS/ADD only support floating-point tensors. Cache blocks
+    // and offsets are int32 indices, so convert around the arithmetic before
+    // converting the resulting Gather index back to int32.
+    CHECK_OPERATION_STATUS_RETURN(AddCastNode(
+        param, opGraph, tensorMap, "dcp_physical_blocks",
+        "dcp_physical_blocks_fp32", ACL_FLOAT));
+
     atb::Node scalePhysicalBlockNode;
     atb::infer::ElewiseParam scalePhysicalBlockParam;
     scalePhysicalBlockParam.elewiseType =
@@ -2101,10 +2085,14 @@ atb::Status AddDecodeDcpSelectedCacheOwnerNodes(
     CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(
         scalePhysicalBlockParam, &scalePhysicalBlockNode.operation));
     scalePhysicalBlockNode.inTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_physical_blocks"});
+        tensorMap, {"dcp_physical_blocks_fp32"});
     scalePhysicalBlockNode.outTensorIds = GetTensorIdxList(
         tensorMap, {"dcp_physical_slots_scaled"});
     opGraph.nodes.push_back(scalePhysicalBlockNode);
+
+    CHECK_OPERATION_STATUS_RETURN(AddCastNode(
+        param, opGraph, tensorMap, "dcp_block_offsets",
+        "dcp_block_offsets_fp32", ACL_FLOAT));
 
     atb::Node physicalSlotNode;
     atb::infer::ElewiseParam physicalSlotParam;
@@ -2113,10 +2101,14 @@ atb::Status AddDecodeDcpSelectedCacheOwnerNodes(
     CHECK_OPERATION_STATUS_RETURN(
         atb::CreateOperation(physicalSlotParam, &physicalSlotNode.operation));
     physicalSlotNode.inTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_physical_slots_scaled", "dcp_block_offsets"});
+        tensorMap, {"dcp_physical_slots_scaled", "dcp_block_offsets_fp32"});
     physicalSlotNode.outTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_physical_slots"});
+        tensorMap, {"dcp_physical_slots_fp32"});
     opGraph.nodes.push_back(physicalSlotNode);
+
+    CHECK_OPERATION_STATUS_RETURN(AddCastNode(
+        param, opGraph, tensorMap, "dcp_physical_slots_fp32",
+        "dcp_physical_slots", ACL_INT32));
 
     for (const auto &cacheTensor : {
              std::make_pair(std::string("in_k_cache"),
@@ -2445,16 +2437,14 @@ atb::Status PreprocessDecodeDcp(
         CHECK_OPERATION_STATUS_RETURN(AddSplitKNode(param, opGraph, tensorMap));
     }
 
-    if (param.isDecodeDcpOwner) {
-        CHECK_OPERATION_STATUS_RETURN(AddLAttnKVNormNode(param, opGraph, tensorMap));
-        CHECK_OPERATION_STATUS_RETURN(AddLAttnRopeNode(param, opGraph, tensorMap));
-    } else {
-        CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpQRopeNode(param, opGraph, tensorMap));
-    }
+    CHECK_OPERATION_STATUS_RETURN(AddLAttnKVNormNode(param, opGraph, tensorMap));
+    CHECK_OPERATION_STATUS_RETURN(AddLAttnRopeNode(param, opGraph, tensorMap));
     CHECK_OPERATION_STATUS_RETURN(PreprocessKV(param, opGraph, tensorMap));
 
     if (param.isDecodeDcpOwner) {
         CHECK_OPERATION_STATUS_RETURN(AddReshapeAndCacheNode(param, opGraph, tensorMap));
+    }
+    if (param.isDecodeDcpOwner) {
         if (!param.skipTopk) {
             CHECK_OPERATION_STATUS_RETURN(AddLAttnQNormRecalNode(param, opGraph, tensorMap));
             CHECK_OPERATION_STATUS_RETURN(AddIndexerQBNode(param, opGraph, tensorMap));
