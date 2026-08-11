@@ -2461,7 +2461,7 @@ atb::Status AddLayerwisePrefillHistoryNodes(
         << "Layerwise prefill history requires an ND key/value cache layout.";
 
     auto addCacheGather = [&opGraph, &tensorMap](const std::string &cache,
-                                                 const std::string &out) {
+                                                 const std::string &out) -> atb::Status {
         atb::Node gatherNode;
         atb::infer::GatherParam gatherParam;
         CHECK_OPERATION_STATUS_RETURN(
