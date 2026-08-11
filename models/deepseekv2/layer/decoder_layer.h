@@ -76,6 +76,9 @@ public:
     // Decode layer-owner context parallelism. The owner role is static for a
     // layer and is resolved from ATTN_DECODE_DCP during graph construction.
     bool enableDecodeDcpLayerOwner = false;
+    // Prefill history materialization for layerwise KV cache. Only meaningful
+    // when the framework really shards the persistent cache by layer owner.
+    bool enableLayerwisePrefillHistory = false;
     int decodeDcpBlockSize = 0;
     // translated
     int attnStreamNum = 1;

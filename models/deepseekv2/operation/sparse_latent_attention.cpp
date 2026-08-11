@@ -146,9 +146,10 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnInTensorCandidates(
         {"decode_dcp", {
             "in_dcp_selected_cache_buffer", "in_dcp_topk_buffer",
             "in_dcp_logical_block_lut", "in_dcp_block_offset_lut",
-            "in_dcp_packed_gather_indices", "in_dcp_packed_query_block_rows",
-            "in_dcp_actual_seq_lengths_query", "in_dcp_actual_seq_lengths_key",
-            "in_dcp_identity_topk"}},
+            "in_dcp_packed_gather_indices", "in_dcp_packed_query_block_rows"}},
+        {"layerwise_prefill", {
+            "in_lw_history_slots", "in_lw_history_kv_buffer",
+            "in_lw_history_indexer_buffer"}},
         {"cp_prefixcache", {
             "in_prefix_slots"
         }},
@@ -243,21 +244,34 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
         {"cp_prefixcache_allgather_indexer", {
             "prefix_indexer_k_allgather"
         }},
+        // Every rank maps the shared top-k to physical slots: the owner needs
+        // them to gather, and a non-owner needs the same slots to scatter the
+        // broadcast rows into its scratch cache.
         {"decode_dcp", {
-            "dcp_selected_cache", "dcp_selected_latent", "dcp_selected_rope"
-        }},
-        {"decode_dcp_internal_topk", {"dcp_topk"}},
-        {"decode_dcp_owner", {
+            "dcp_selected_cache",
             "dcp_valid_logical_positions",
             "dcp_logical_blocks", "dcp_block_offsets",
             "dcp_block_table_rows", "dcp_physical_blocks",
             "dcp_physical_blocks_fp32", "dcp_block_offsets_fp32",
             "dcp_physical_slots_scaled", "dcp_physical_slots_fp32",
-            "dcp_physical_slots",
+            "dcp_physical_slots"
+        }},
+        {"decode_dcp_internal_topk", {"dcp_topk"}},
+        {"decode_dcp_owner", {
             "dcp_selected_latent_local", "dcp_selected_rope_local",
             "dcp_selected_cache_local"
         }},
+        {"decode_dcp_non_owner", {
+            "dcp_selected_latent", "dcp_selected_rope"
+        }},
         {"decode_dcp_owner_topk", {"dcp_raw_topk"}},
+        {"layerwise_prefill", {"lw_history_kv", "lw_history_indexer"}},
+        {"layerwise_prefill_owner", {
+            "lw_history_latent_local", "lw_history_rope_local"
+        }},
+        {"layerwise_prefill_non_owner", {
+            "lw_history_latent", "lw_history_rope"
+        }},
     };
     return latentAttnIntermediateTensorCandidates;
 }
@@ -298,9 +312,14 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
         AddTensorToList(latentAttnIntermediateTensorCandidates, !param.enablePreprocessLcocTp ? \
             "qkvdown_dp" : "enable_preprocess_lcoc_tp", intermediateTensorList);
     }
+    const bool buildsLocalIndexer =
+        !param.enableDecodeDcpLayerOwner || param.isDecodeDcpOwner;
     if (param.enableMlaPreprocess && !param.isPrefill) {
         AddTensorToList(latentAttnIntermediateTensorCandidates, "mla_preprocess", intermediateTensorList);
-        if (param.skipTopk) {
+        // The fused preprocess always emits the indexer norm, so declare it
+        // even on a rank that never builds the indexer chain: a top-k sharing
+        // consumer, or a layerwise non-owner.
+        if (param.skipTopk || !buildsLocalIndexer) {
             AddTensorToList(latentAttnIntermediateTensorCandidates, "indexer_skipped", intermediateTensorList);
         }
     } else {
@@ -322,8 +341,6 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
             AddTensorToList(latentAttnIntermediateTensorCandidates, "decode", intermediateTensorList);
         }
     }
-    const bool buildsLocalIndexer =
-        !param.enableDecodeDcpLayerOwner || param.isDecodeDcpOwner;
     if (!param.skipTopk && buildsLocalIndexer) {
         AddTensorToList(latentAttnIntermediateTensorCandidates, "indexer", intermediateTensorList);
         if (!param.outputTopk) {
@@ -333,6 +350,15 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
     if (param.skipTopk) {
         AddTensorToList(latentAttnInTensorCandidates, "topk_share", inTensorList);
     }
+    if (param.enableLayerwisePrefillHistory && param.isPrefill) {
+        AddTensorToList(latentAttnInTensorCandidates, "layerwise_prefill", inTensorList);
+        AddTensorToList(latentAttnIntermediateTensorCandidates,
+            "layerwise_prefill", intermediateTensorList);
+        AddTensorToList(latentAttnIntermediateTensorCandidates,
+            param.isDecodeDcpOwner ? "layerwise_prefill_owner"
+                                   : "layerwise_prefill_non_owner",
+            intermediateTensorList);
+    }
     if (param.enableDecodeDcpLayerOwner) {
         AddTensorToList(latentAttnInTensorCandidates, "decode_dcp", inTensorList);
         AddTensorToList(latentAttnIntermediateTensorCandidates, "decode_dcp", intermediateTensorList);
@@ -340,13 +366,12 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
             AddTensorToList(latentAttnIntermediateTensorCandidates,
                 "decode_dcp_internal_topk", intermediateTensorList);
         }
-        if (param.isDecodeDcpOwner) {
+        AddTensorToList(latentAttnIntermediateTensorCandidates,
+            param.isDecodeDcpOwner ? "decode_dcp_owner" : "decode_dcp_non_owner",
+            intermediateTensorList);
+        if (param.isDecodeDcpOwner && param.outputTopk) {
             AddTensorToList(latentAttnIntermediateTensorCandidates,
-                "decode_dcp_owner", intermediateTensorList);
-            if (param.outputTopk) {
-                AddTensorToList(latentAttnIntermediateTensorCandidates,
-                    "decode_dcp_owner_topk", intermediateTensorList);
-            }
+                "decode_dcp_owner_topk", intermediateTensorList);
         }
     }
     AddTensorToList(latentAttnIntermediateTensorCandidates, "ein_reproj", intermediateTensorList);
@@ -2004,7 +2029,7 @@ atb::Status AddDecodeDcpTopkBroadcastNode(
 }
 
 template <typename NormParamType>
-atb::Status AddDecodeDcpSelectedCacheOwnerNodes(
+atb::Status AddDecodeDcpSlotMappingNodes(
     const LatentAttentionParam<NormParamType> &param,
     atb::GraphParam &opGraph,
     std::map<std::string, uint32_t> &tensorMap)
@@ -2109,7 +2134,17 @@ atb::Status AddDecodeDcpSelectedCacheOwnerNodes(
     CHECK_OPERATION_STATUS_RETURN(AddCastNode(
         param, opGraph, tensorMap, "dcp_physical_slots_fp32",
         "dcp_physical_slots", ACL_INT32));
+    return atb::NO_ERROR;
+}
 
+// Owner only: read the selected rows out of the layer's own paged cache and
+// pack them so a single broadcast carries latent and rope together.
+template <typename NormParamType>
+atb::Status AddDecodeDcpSelectedCacheGatherNodes(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
     for (const auto &cacheTensor : {
              std::make_pair(std::string("in_k_cache"),
                             std::string("dcp_selected_latent_local")),
@@ -2161,7 +2196,19 @@ atb::Status AddDecodeDcpSelectedCacheBroadcastNodes(
         opGraph, tensorMap, source, "dcp_selected_cache"));
     CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpBroadcastNode(
         param, opGraph, tensorMap, "dcp_selected_cache"));
+    return atb::NO_ERROR;
+}
 
+// Non-owner only: place the broadcast rows into the shared scratch cache at the
+// very slots the real block table resolves to. After this the layer's attention
+// reads the scratch exactly like an owner reads its own cache, so the rest of
+// the graph needs no knowledge of layer ownership.
+template <typename NormParamType>
+atb::Status AddDecodeDcpSelectedCacheScatterNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
     atb::Node splitSelectedCacheNode;
     atb::infer::SplitParam splitSelectedCacheParam = {
         2, 2, {param.kvLoraRank, param.qkRopeHeadDim}};
@@ -2172,41 +2219,16 @@ atb::Status AddDecodeDcpSelectedCacheBroadcastNodes(
     splitSelectedCacheNode.outTensorIds = GetTensorIdxList(
         tensorMap, {"dcp_selected_latent", "dcp_selected_rope"});
     opGraph.nodes.push_back(splitSelectedCacheNode);
-    return atb::NO_ERROR;
-}
 
-template <typename NormParamType>
-atb::Status AddDecodeDcpSparseFlashAttentionNode(
-    const LatentAttentionParam<NormParamType> &param,
-    atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node sparseFlashAttentionNode;
-    atb_speed::common::SparseFlashAttentionParam sparseFlashAttentionParam;
-    sparseFlashAttentionParam.queryLayout = "TND";
-    sparseFlashAttentionParam.kvLayout = "TND";
-    sparseFlashAttentionParam.scaleValue = param.softmaxScale;
-    sparseFlashAttentionParam.sparseBlockSize = 1;
-    sparseFlashAttentionParam.hasBlockTable = false;
-    sparseFlashAttentionNode.operation =
-        new atb_speed::common::SparseFlashAttentionOperation(
-            "AclNNDecodeDcpSparseFlashAttentionNode",
-            sparseFlashAttentionParam);
-    sparseFlashAttentionNode.inTensorIds = GetTensorIdxList(tensorMap, {
-        "intermediate_q_t", "dcp_selected_latent", "dcp_selected_latent",
-        "in_dcp_identity_topk", "in_block_tables",
-        "in_dcp_actual_seq_lengths_query", "in_dcp_actual_seq_lengths_key",
-        "rope_q_o", "dcp_selected_rope"});
-    sparseFlashAttentionNode.outTensorIds = GetTensorIdxList(
-        tensorMap, {"intermediate_self_attention"});
-    sparseFlashAttentionNode.inTensorReshapeFuncs.resize(
-        sparseFlashAttentionNode.inTensorIds.size());
-    sparseFlashAttentionNode.inTensorReshapeFuncs[7] =
-        [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-            UnSqueezeHeadNumHeadDim(
-                oldShape, newShape, param.qkRopeHeadDim);
-        };
-    opGraph.nodes.push_back(sparseFlashAttentionNode);
+    atb::Node scatterNode;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(param.reshapeCacheParm, &scatterNode.operation));
+    scatterNode.inTensorIds = GetTensorIdxList(tensorMap, {
+        "dcp_selected_latent", "dcp_selected_rope",
+        "in_k_cache", "in_k_rope_cache", "dcp_physical_slots"});
+    scatterNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"in_k_cache", "in_k_rope_cache"});
+    opGraph.nodes.push_back(scatterNode);
     return atb::NO_ERROR;
 }
 
@@ -2234,10 +2256,14 @@ atb::Status AddSparseFlashAttentionNode(
         q_nope = "intermediate_q_nope";
         q_pe = "intermediate_q_rope";
     }
+    // Layerwise DCP always consumes the broadcast top-k so every rank in the
+    // group resolves the same logical positions, including the owner.
     std::string topk_indices =
         param.skipTopk ? "in_shared_topk_indices"
-                       : (param.outputTopk ? "out_topk_indices"
-                                           : "intermediate_topk_indices");
+                       : (param.enableDecodeDcpLayerOwner
+                              ? "dcp_topk"
+                              : (param.outputTopk ? "out_topk_indices"
+                                                  : "intermediate_topk_indices"));
     sparseFlashAttentionNode.inTensorIds = {
         GetTensorIdx(tensorMap, q_nope),
         GetTensorIdx(tensorMap, "in_k_cache"),
@@ -2414,6 +2440,115 @@ atb::Status AddReprojVTransposeNode(const LatentAttentionParam<NormParamType> &p
 }
 
 
+// Layerwise KV cache prefill: only the layer owner keeps this layer's history,
+// so it reads the rows the batch will attend over and hands them to the group.
+// Every non-owner writes them into its shared scratch cache at the very slots
+// the real block table resolves to, after which the ordinary prefill graph runs
+// identically on both roles. Chunked prefill and prefix-cache hits therefore
+// need no dedicated path: their history is just more slots in this list.
+//
+// This must run before the current chunk is written to the cache, otherwise a
+// history row landing in the same block would overwrite a fresh token.
+template <typename NormParamType>
+atb::Status AddLayerwisePrefillHistoryNodes(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    CHECK(param.isPrefill);
+    CHECK(param.reshapeCacheParm.kvCacheCfg ==
+          atb::infer::ReshapeAndCacheParam::KvCacheCfg::K_CACHE_V_CACHE)
+        << "Layerwise prefill history requires an ND key/value cache layout.";
+
+    auto addCacheGather = [&opGraph, &tensorMap](const std::string &cache,
+                                                 const std::string &out) {
+        atb::Node gatherNode;
+        atb::infer::GatherParam gatherParam;
+        CHECK_OPERATION_STATUS_RETURN(
+            atb::CreateOperation(gatherParam, &gatherNode.operation));
+        gatherNode.inTensorIds = GetTensorIdxList(
+            tensorMap, {cache, "in_lw_history_slots"});
+        gatherNode.outTensorIds = GetTensorIdxList(tensorMap, {out});
+        gatherNode.inTensorReshapeFuncs.resize(gatherNode.inTensorIds.size());
+        gatherNode.inTensorReshapeFuncs[0] =
+            [](const atb::Dims &oldShape, atb::Dims &newShape) {
+                newShape.dimNum = 3;
+                newShape.dims[0] = oldShape.dims[0] * oldShape.dims[1];
+                newShape.dims[1] = oldShape.dims[2];
+                newShape.dims[2] = oldShape.dims[3];
+            };
+        opGraph.nodes.push_back(gatherNode);
+        return atb::NO_ERROR;
+    };
+
+    if (param.isDecodeDcpOwner) {
+        CHECK_OPERATION_STATUS_RETURN(
+            addCacheGather("in_k_cache", "lw_history_latent_local"));
+        CHECK_OPERATION_STATUS_RETURN(
+            addCacheGather("in_k_rope_cache", "lw_history_rope_local"));
+
+        atb::Node concatNode;
+        atb::infer::ConcatParam concatParam;
+        concatParam.concatDim = 2;
+        CHECK_OPERATION_STATUS_RETURN(
+            atb::CreateOperation(concatParam, &concatNode.operation));
+        concatNode.inTensorIds = GetTensorIdxList(
+            tensorMap, {"lw_history_latent_local", "lw_history_rope_local"});
+        concatNode.outTensorIds = GetTensorIdxList(tensorMap, {"lw_history_kv"});
+        opGraph.nodes.push_back(concatNode);
+
+        CHECK_OPERATION_STATUS_RETURN(
+            addCacheGather("in_k_cache_indexer", "lw_history_indexer"));
+    } else {
+        CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpCopyNode(
+            opGraph, tensorMap, "in_lw_history_kv_buffer", "lw_history_kv"));
+        CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpCopyNode(
+            opGraph, tensorMap, "in_lw_history_indexer_buffer",
+            "lw_history_indexer"));
+    }
+
+    CHECK_OPERATION_STATUS_RETURN(
+        AddDecodeDcpBroadcastNode(param, opGraph, tensorMap, "lw_history_kv"));
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpBroadcastNode(
+        param, opGraph, tensorMap, "lw_history_indexer"));
+    if (param.isDecodeDcpOwner) {
+        return atb::NO_ERROR;
+    }
+
+    atb::Node splitNode;
+    atb::infer::SplitParam splitParam = {
+        2, 2, {param.kvLoraRank, param.qkRopeHeadDim}};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(splitParam, &splitNode.operation));
+    splitNode.inTensorIds = GetTensorIdxList(tensorMap, {"lw_history_kv"});
+    splitNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"lw_history_latent", "lw_history_rope"});
+    opGraph.nodes.push_back(splitNode);
+
+    atb::Node kvScatterNode;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(param.reshapeCacheParm, &kvScatterNode.operation));
+    kvScatterNode.inTensorIds = GetTensorIdxList(tensorMap, {
+        "lw_history_latent", "lw_history_rope",
+        "in_k_cache", "in_k_rope_cache", "in_lw_history_slots"});
+    kvScatterNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"in_k_cache", "in_k_rope_cache"});
+    opGraph.nodes.push_back(kvScatterNode);
+
+    atb::Node indexerScatterNode;
+    atb::infer::ReshapeAndCacheParam indexerScatterParam;
+    indexerScatterParam.kvCacheCfg =
+        atb::infer::ReshapeAndCacheParam::KvCacheCfg::K_CACHE_V_BYPASS;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(
+        indexerScatterParam, &indexerScatterNode.operation));
+    indexerScatterNode.inTensorIds = GetTensorIdxList(tensorMap, {
+        "lw_history_indexer", "in_k_cache_indexer", "in_lw_history_slots"});
+    indexerScatterNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"in_k_cache_indexer"});
+    opGraph.nodes.push_back(indexerScatterNode);
+    return atb::NO_ERROR;
+}
+
 template <typename NormParamType>
 atb::Status PreprocessDecodeDcp(
     const LatentAttentionParam<NormParamType> &param,
@@ -2421,32 +2556,47 @@ atb::Status PreprocessDecodeDcp(
     std::map<std::string, uint32_t> &tensorMap)
 {
     CHECK(!param.isPrefill);
-    CHECK(!param.enableMlaPreprocess)
-        << "Decode DCP requires the ordinary MLA preprocess path.";
+    // The owner gathers selected rows by flattening the paged cache to
+    // [numBlocks * blockSize, ...], which only holds for an ND layout.
+    CHECK(param.reshapeCacheParm.kvCacheCfg ==
+          atb::infer::ReshapeAndCacheParam::KvCacheCfg::K_CACHE_V_CACHE)
+        << "Decode DCP requires an ND key/value cache layout.";
 
-    CHECK_OPERATION_STATUS_RETURN(AddLAttnPreNormNode(param, opGraph, tensorMap));
-    if (param.qLoraRank > 0) {
-        CHECK_OPERATION_STATUS_RETURN(AddLAttnQKVProjNode(param, opGraph, tensorMap));
-        CHECK_OPERATION_STATUS_RETURN(AddSplitQKNode(param, opGraph, tensorMap));
-        CHECK_OPERATION_STATUS_RETURN(AddLAttnQProjBNode(param, opGraph, tensorMap));
-        CHECK_OPERATION_STATUS_RETURN(AddSplitQNode(param, opGraph, tensorMap));
+    const bool useMlaPreprocess = param.qLoraRank > 0 && param.enableMlaPreprocess;
+    if (useMlaPreprocess) {
+        // The fused preprocess produces this rank's Q and writes the token's
+        // MLA cache in one node, so it cannot be split by ownership and both
+        // roles run it. A non-owner's write lands in the shared scratch at the
+        // real slot and carries the same value the owner would broadcast, so it
+        // is idempotent with the scatter below.
+        CHECK_OPERATION_STATUS_RETURN(AddMlaPreprocessV2Node(param, opGraph, tensorMap));
     } else {
-        CHECK_OPERATION_STATUS_RETURN(AddLAttnQProjANode(param, opGraph, tensorMap));
-        CHECK_OPERATION_STATUS_RETURN(AddSplitQNode(param, opGraph, tensorMap));
-        CHECK_OPERATION_STATUS_RETURN(AddLAttnKVAProjNode(param, opGraph, tensorMap));
-        CHECK_OPERATION_STATUS_RETURN(AddSplitKNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnPreNormNode(param, opGraph, tensorMap));
+        if (param.qLoraRank > 0) {
+            CHECK_OPERATION_STATUS_RETURN(AddLAttnQKVProjNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddSplitQKNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddLAttnQProjBNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddSplitQNode(param, opGraph, tensorMap));
+        } else {
+            CHECK_OPERATION_STATUS_RETURN(AddLAttnQProjANode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddSplitQNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddLAttnKVAProjNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddSplitKNode(param, opGraph, tensorMap));
+        }
+
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnKVNormNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnRopeNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(PreprocessKV(param, opGraph, tensorMap));
+        if (param.isDecodeDcpOwner) {
+            CHECK_OPERATION_STATUS_RETURN(AddReshapeAndCacheNode(param, opGraph, tensorMap));
+        }
     }
 
-    CHECK_OPERATION_STATUS_RETURN(AddLAttnKVNormNode(param, opGraph, tensorMap));
-    CHECK_OPERATION_STATUS_RETURN(AddLAttnRopeNode(param, opGraph, tensorMap));
-    CHECK_OPERATION_STATUS_RETURN(PreprocessKV(param, opGraph, tensorMap));
-
-    if (param.isDecodeDcpOwner) {
-        CHECK_OPERATION_STATUS_RETURN(AddReshapeAndCacheNode(param, opGraph, tensorMap));
-    }
     if (param.isDecodeDcpOwner) {
         if (!param.skipTopk) {
-            CHECK_OPERATION_STATUS_RETURN(AddLAttnQNormRecalNode(param, opGraph, tensorMap));
+            if (!useMlaPreprocess) {
+                CHECK_OPERATION_STATUS_RETURN(AddLAttnQNormRecalNode(param, opGraph, tensorMap));
+            }
             CHECK_OPERATION_STATUS_RETURN(AddIndexerQBNode(param, opGraph, tensorMap));
             CHECK_OPERATION_STATUS_RETURN(AddIndexerQBSplitNode(param, opGraph, tensorMap));
             CHECK_OPERATION_STATUS_RETURN(AddIndexerInputNormRecalNode(param, opGraph, tensorMap));
@@ -2464,10 +2614,19 @@ atb::Status PreprocessDecodeDcp(
     if (!param.skipTopk) {
         CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpTopkBroadcastNode(param, opGraph, tensorMap));
     }
+    // Both roles map the shared top-k to physical slots against the same block
+    // table, so the owner gathers from and the non-owner scatters into the very
+    // same addresses.
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpSlotMappingNodes(param, opGraph, tensorMap));
     if (param.isDecodeDcpOwner) {
-        CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpSelectedCacheOwnerNodes(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(
+            AddDecodeDcpSelectedCacheGatherNodes(param, opGraph, tensorMap));
     }
     CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpSelectedCacheBroadcastNodes(param, opGraph, tensorMap));
+    if (!param.isDecodeDcpOwner) {
+        CHECK_OPERATION_STATUS_RETURN(
+            AddDecodeDcpSelectedCacheScatterNode(param, opGraph, tensorMap));
+    }
     return atb::NO_ERROR;
 }
 
@@ -2477,6 +2636,10 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
 {   
     if (param.enableDecodeDcpLayerOwner) {
         return PreprocessDecodeDcp(param, opGraph, tensorMap);
+    }
+    if (param.enableLayerwisePrefillHistory && param.isPrefill) {
+        CHECK_OPERATION_STATUS_RETURN(
+            AddLayerwisePrefillHistoryNodes(param, opGraph, tensorMap));
     }
     const bool useMlaPreprocess = param.qLoraRank > 0 && param.enableMlaPreprocess && !param.isPrefill;
     if (useMlaPreprocess) {
@@ -2668,10 +2831,7 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
     // Preprocess
     CHECK_OPERATION_STATUS_RETURN(sparse::Preprocess(param, opGraph, tensorMap));
     // PA or MLA
-    if (param.enableDecodeDcpLayerOwner) {
-        CHECK_OPERATION_STATUS_RETURN(
-            sparse::AddDecodeDcpSparseFlashAttentionNode(param, opGraph, tensorMap));
-    } else if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
     // CP Attention
         CHECK_OPERATION_STATUS_RETURN(sparse::AddSparseFlashAttentionCpNode(param, opGraph, tensorMap));
     }

@@ -68,6 +68,10 @@ struct LatentAttentionParam {
     bool skipTopk = false;
     bool outputTopk = false;
     bool enableDecodeDcpLayerOwner = false;
+    // Prefill counterpart of layerwise KV cache: the layer owner materializes
+    // the history of this layer into every non-owner's shared scratch cache so
+    // the rest of the prefill graph runs unchanged on both roles.
+    bool enableLayerwisePrefillHistory = false;
     bool isDecodeDcpOwner = false;
     int decodeDcpOwnerRank = 0;
     int decodeDcpBlockSize = 0;

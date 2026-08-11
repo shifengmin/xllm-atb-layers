@@ -154,9 +154,10 @@ std::map<std::string, std::vector<std::string>> GetDeepseekV2LayerInTensorCandid
         {"decode_dcp", {
             "in_dcp_selected_cache_buffer", "in_dcp_topk_buffer",
             "in_dcp_logical_block_lut", "in_dcp_block_offset_lut",
-            "in_dcp_packed_gather_indices", "in_dcp_packed_query_block_rows",
-            "in_dcp_actual_seq_lengths_query", "in_dcp_actual_seq_lengths_key",
-            "in_dcp_identity_topk"}}
+            "in_dcp_packed_gather_indices", "in_dcp_packed_query_block_rows"}},
+        {"layerwise_prefill", {
+            "in_lw_history_slots", "in_lw_history_kv_buffer",
+            "in_lw_history_indexer_buffer"}}
     };
     SetDeepseekV2LayerInTensorDefaultCandidates(deepseekV2LayerInTensorCandidates);
     return deepseekV2LayerInTensorCandidates;
@@ -281,6 +282,10 @@ std::map<std::string, uint32_t> ConstructTensorMap(
     }
     if (param.skipTopk) {
         atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "topk_share", inTensorList);
+    }
+    if (param.enableLayerwisePrefillHistory && param.isPrefill) {
+        atb_speed::common::AddTensorToList(
+            deepseekV2InTensorCandidates, "layerwise_prefill", inTensorList);
     }
     if (param.enableDecodeDcpLayerOwner) {
         atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "decode_dcp", inTensorList);
@@ -488,8 +493,11 @@ atb::Status SetLatentAttentionParam(
     latentAttentionParam.outputTopk = param.outputTopk;
     latentAttentionParam.enableDecodeDcpLayerOwner =
         param.enableDecodeDcpLayerOwner;
+    latentAttentionParam.enableLayerwisePrefillHistory =
+        param.enableLayerwisePrefillHistory;
     latentAttentionParam.decodeDcpBlockSize = param.decodeDcpBlockSize;
-    if (param.enableDecodeDcpLayerOwner) {
+    if (param.enableDecodeDcpLayerOwner ||
+        param.enableLayerwisePrefillHistory) {
         CHECK(param.mapping.Has(base::ATTN_DECODE_DCP))
             << "Decode DCP mapping is missing.";
         latentAttentionParam.decodeDcpInfo =
@@ -627,6 +635,10 @@ int64_t SetAttention(atb::GraphParam &opGraph, const DecoderLayerParam &param,
     }
     if (param.skipTopk) {
         atb_speed::common::AddTensorToList(GetDeepseekV2LayerInTensorCandidates(), "topk_share", attnInTensorNames);
+    }
+    if (param.enableLayerwisePrefillHistory && param.isPrefill) {
+        atb_speed::common::AddTensorToList(
+            GetDeepseekV2LayerInTensorCandidates(), "layerwise_prefill", attnInTensorNames);
     }
     if (param.enableDecodeDcpLayerOwner) {
         atb_speed::common::AddTensorToList(
