@@ -25,6 +25,7 @@
 #include "operations/aclnn/ops/sparse_flash_attention_operation.h"
 #include "operations/aclnn/ops/mla_preprocess_v2_operation.h"
 #include <operations/aclnn/ops/multi_latent_attention.h>
+#include "operations/tilelang/topk_logical_to_physical_slots_operation.h"
 #include "operations/fusion/utils.h"
 #include "models/deepseekv2/operation/fa_update.h"
 #include "models/deepseekv2/operation/ring_attention.h"
@@ -145,7 +146,6 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnInTensorCandidates(
         {"topk_share", {"in_shared_topk_indices"}},
         {"decode_dcp", {
             "in_dcp_selected_cache_buffer", "in_dcp_topk_buffer",
-            "in_dcp_logical_block_lut", "in_dcp_block_offset_lut",
             "in_dcp_packed_gather_indices", "in_dcp_packed_query_block_rows"}},
         {"layerwise_prefill", {
             "in_lw_history_slots", "in_lw_history_kv_buffer",
@@ -249,11 +249,6 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
         // broadcast rows into its scratch cache.
         {"decode_dcp", {
             "dcp_selected_cache",
-            "dcp_valid_logical_positions",
-            "dcp_logical_blocks", "dcp_block_offsets",
-            "dcp_block_table_rows", "dcp_physical_blocks",
-            "dcp_physical_blocks_fp32", "dcp_block_offsets_fp32",
-            "dcp_physical_slots_scaled", "dcp_physical_slots_fp32",
             "dcp_physical_slots"
         }},
         {"decode_dcp_internal_topk", {"dcp_topk"}},
@@ -2037,103 +2032,16 @@ atb::Status AddDecodeDcpSlotMappingNodes(
     const std::string topkSource = param.skipTopk ?
         "in_shared_topk_indices" : "dcp_topk";
 
-    atb::Node compactTopkNode;
-    atb::infer::GatherParam compactTopkParam;
-    CHECK_OPERATION_STATUS_RETURN(
-        atb::CreateOperation(compactTopkParam, &compactTopkNode.operation));
-    compactTopkNode.inTensorIds = GetTensorIdxList(
-        tensorMap, {topkSource, "in_dcp_packed_gather_indices"});
-    compactTopkNode.outTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_valid_logical_positions"});
-    compactTopkNode.inTensorReshapeFuncs.resize(
-        compactTopkNode.inTensorIds.size());
-    compactTopkNode.inTensorReshapeFuncs[0] =
-        [](const atb::Dims &oldShape, atb::Dims &newShape) {
-            newShape.dimNum = 1;
-            newShape.dims[0] = 1;
-            for (uint32_t dim = 0; dim < oldShape.dimNum; ++dim) {
-                newShape.dims[0] *= oldShape.dims[dim];
-            }
-        };
-    opGraph.nodes.push_back(compactTopkNode);
-
-    for (const auto &lutTensor : {
-             std::make_pair(std::string("in_dcp_logical_block_lut"),
-                            std::string("dcp_logical_blocks")),
-             std::make_pair(std::string("in_dcp_block_offset_lut"),
-                            std::string("dcp_block_offsets"))}) {
-        atb::Node lutGatherNode;
-        atb::infer::GatherParam lutGatherParam;
-        CHECK_OPERATION_STATUS_RETURN(
-            atb::CreateOperation(lutGatherParam, &lutGatherNode.operation));
-        lutGatherNode.inTensorIds = GetTensorIdxList(
-            tensorMap, {lutTensor.first, "dcp_valid_logical_positions"});
-        lutGatherNode.outTensorIds = GetTensorIdxList(
-            tensorMap, {lutTensor.second});
-        opGraph.nodes.push_back(lutGatherNode);
-    }
-
-    atb::Node blockTableRowsNode;
-    atb::infer::GatherParam blockTableRowsParam;
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(
-        blockTableRowsParam, &blockTableRowsNode.operation));
-    blockTableRowsNode.inTensorIds = GetTensorIdxList(
-        tensorMap, {"in_block_tables", "in_dcp_packed_query_block_rows"});
-    blockTableRowsNode.outTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_block_table_rows"});
-    opGraph.nodes.push_back(blockTableRowsNode);
-
-    atb::Node physicalBlockNode;
-    atb::infer::GatherParam physicalBlockParam;
-    physicalBlockParam.axis = 1;
-    physicalBlockParam.batchDims = 1;
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(
-        physicalBlockParam, &physicalBlockNode.operation));
-    physicalBlockNode.inTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_block_table_rows", "dcp_logical_blocks"});
-    physicalBlockNode.outTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_physical_blocks"});
-    opGraph.nodes.push_back(physicalBlockNode);
-
-    // ATB Elewise MULS/ADD only support floating-point tensors. Cache blocks
-    // and offsets are int32 indices, so convert around the arithmetic before
-    // converting the resulting Gather index back to int32.
-    CHECK_OPERATION_STATUS_RETURN(AddCastNode(
-        param, opGraph, tensorMap, "dcp_physical_blocks",
-        "dcp_physical_blocks_fp32", ACL_FLOAT));
-
-    atb::Node scalePhysicalBlockNode;
-    atb::infer::ElewiseParam scalePhysicalBlockParam;
-    scalePhysicalBlockParam.elewiseType =
-        atb::infer::ElewiseParam::ElewiseType::ELEWISE_MULS;
-    scalePhysicalBlockParam.mulsParam.varAttr = param.decodeDcpBlockSize;
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(
-        scalePhysicalBlockParam, &scalePhysicalBlockNode.operation));
-    scalePhysicalBlockNode.inTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_physical_blocks_fp32"});
-    scalePhysicalBlockNode.outTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_physical_slots_scaled"});
-    opGraph.nodes.push_back(scalePhysicalBlockNode);
-
-    CHECK_OPERATION_STATUS_RETURN(AddCastNode(
-        param, opGraph, tensorMap, "dcp_block_offsets",
-        "dcp_block_offsets_fp32", ACL_FLOAT));
-
-    atb::Node physicalSlotNode;
-    atb::infer::ElewiseParam physicalSlotParam;
-    physicalSlotParam.elewiseType =
-        atb::infer::ElewiseParam::ElewiseType::ELEWISE_ADD;
-    CHECK_OPERATION_STATUS_RETURN(
-        atb::CreateOperation(physicalSlotParam, &physicalSlotNode.operation));
-    physicalSlotNode.inTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_physical_slots_scaled", "dcp_block_offsets_fp32"});
-    physicalSlotNode.outTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_physical_slots_fp32"});
-    opGraph.nodes.push_back(physicalSlotNode);
-
-    CHECK_OPERATION_STATUS_RETURN(AddCastNode(
-        param, opGraph, tensorMap, "dcp_physical_slots_fp32",
-        "dcp_physical_slots", ACL_INT32));
+    atb::Node slotMappingNode;
+    slotMappingNode.operation = new TopkLogicalToPhysicalSlotsOperation(
+        param.decodeDcpBlockSize);
+    slotMappingNode.inTensorIds = GetTensorIdxList(
+        tensorMap,
+        {topkSource, "in_block_tables", "in_dcp_packed_gather_indices",
+         "in_dcp_packed_query_block_rows"});
+    slotMappingNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_physical_slots"});
+    opGraph.nodes.push_back(slotMappingNode);
     return atb::NO_ERROR;
 }
 

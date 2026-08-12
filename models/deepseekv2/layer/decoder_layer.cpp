@@ -153,7 +153,6 @@ std::map<std::string, std::vector<std::string>> GetDeepseekV2LayerInTensorCandid
             "in_shared_topk_indices"}},
         {"decode_dcp", {
             "in_dcp_selected_cache_buffer", "in_dcp_topk_buffer",
-            "in_dcp_logical_block_lut", "in_dcp_block_offset_lut",
             "in_dcp_packed_gather_indices", "in_dcp_packed_query_block_rows"}},
         {"layerwise_prefill", {
             "in_lw_history_slots", "in_lw_history_kv_buffer",
