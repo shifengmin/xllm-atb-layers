@@ -152,8 +152,9 @@ std::map<std::string, std::vector<std::string>> GetDeepseekV2LayerInTensorCandid
         {"topk_share", {
             "in_shared_topk_indices"}},
         {"decode_dcp", {
-            "in_dcp_selected_cache_buffer", "in_dcp_topk_buffer",
-            "in_dcp_packed_gather_indices", "in_dcp_packed_query_block_rows"}},
+            "in_dcp_attention_output_buffer"}},
+        {"decode_dcp_topk", {
+            "in_dcp_topk_receive_buffer"}},
         {"layerwise_prefill", {
             "in_lw_history_slots", "in_lw_history_kv_buffer",
             "in_lw_history_indexer_buffer"}}
@@ -288,6 +289,10 @@ std::map<std::string, uint32_t> ConstructTensorMap(
     }
     if (param.enableDecodeDcpLayerOwner) {
         atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "decode_dcp", inTensorList);
+        if (param.outputTopk) {
+            atb_speed::common::AddTensorToList(
+                deepseekV2InTensorCandidates, "decode_dcp_topk", inTensorList);
+        }
     }
     if (param.mapping.Get(base::ATTN_CP).IsEnabled() && param.isPrefill) {
         if (param.index_n_heads > 0) {
@@ -494,7 +499,6 @@ atb::Status SetLatentAttentionParam(
         param.enableDecodeDcpLayerOwner;
     latentAttentionParam.enableLayerwisePrefillHistory =
         param.enableLayerwisePrefillHistory;
-    latentAttentionParam.decodeDcpBlockSize = param.decodeDcpBlockSize;
     if (param.enableDecodeDcpLayerOwner ||
         param.enableLayerwisePrefillHistory) {
         CHECK(param.mapping.Has(base::ATTN_DECODE_DCP))
@@ -509,7 +513,6 @@ atb::Status SetLatentAttentionParam(
             << "Decode DCP group must contain more than one rank.";
         CHECK_LT(latentAttentionParam.decodeDcpInfo.rank,
             static_cast<uint32_t>(decodeDcpSize));
-        CHECK_GT(latentAttentionParam.decodeDcpBlockSize, 0);
         latentAttentionParam.decodeDcpOwnerRank =
             param.layerId % decodeDcpSize;
         latentAttentionParam.isDecodeDcpOwner =
@@ -642,6 +645,10 @@ int64_t SetAttention(atb::GraphParam &opGraph, const DecoderLayerParam &param,
     if (param.enableDecodeDcpLayerOwner) {
         atb_speed::common::AddTensorToList(
             GetDeepseekV2LayerInTensorCandidates(), "decode_dcp", attnInTensorNames);
+        if (param.outputTopk) {
+            atb_speed::common::AddTensorToList(
+                GetDeepseekV2LayerInTensorCandidates(), "decode_dcp_topk", attnInTensorNames);
+        }
     }
     if (param.enablePrefixCache) {
         atb_speed::common::AddTensorToList(GetDeepseekV2LayerInTensorCandidates(), "prefixcache", attnInTensorNames);

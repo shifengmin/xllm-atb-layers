@@ -79,7 +79,6 @@ public:
     // Prefill history materialization for layerwise KV cache. Only meaningful
     // when the framework really shards the persistent cache by layer owner.
     bool enableLayerwisePrefillHistory = false;
-    int decodeDcpBlockSize = 0;
     // translated
     int attnStreamNum = 1;
     int ffnStreamNum = 1;

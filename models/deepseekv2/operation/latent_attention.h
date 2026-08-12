@@ -74,7 +74,6 @@ struct LatentAttentionParam {
     bool enableLayerwisePrefillHistory = false;
     bool isDecodeDcpOwner = false;
     int decodeDcpOwnerRank = 0;
-    int decodeDcpBlockSize = 0;
     atb_speed::common::ParallelInfo decodeDcpInfo;
 
     int packQuantType = atb_speed::common::PackQuantType::ALL_FP;
