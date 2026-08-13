@@ -30,6 +30,15 @@ void Mapping::ParseParam(const nlohmann::json &paramJson)
         FetchJsonParam<uint32_t>(paramJson, "lcclCommDomainLowerBound"),
         FetchJsonParam<uint32_t>(paramJson, "lcclCommDomainUpperBound")
     );
+    auto parseParallelInfo = [](const nlohmann::json &curParamJson) {
+        atb_speed::common::ParallelInfo parallelInfo;
+        parallelInfo.rank = FetchJsonParam<uint32_t>(curParamJson, "rank");
+        parallelInfo.rankIds = FetchJsonParam<std::vector<uint32_t>>(
+            curParamJson["rankIds"], "rankIds", true);
+        parallelInfo.bufferSize = FetchJsonParam<uint32_t>(curParamJson, "bufferSize");
+        parallelInfo.groupId = FetchJsonParam<uint32_t>(curParamJson, "groupId");
+        return parallelInfo;
+    };
     std::map<ParallelType, std::string> strategyKeyMap = {
         {WORD_EMBED_TP, "wordEmbedTp"},
         {WORD_EMBED_DP, "wordEmbedDp"},
@@ -48,26 +57,16 @@ void Mapping::ParseParam(const nlohmann::json &paramJson)
         {LCOC_ATTN_TP, "lcocAttnTp"},
     };
     for (auto it = strategyKeyMap.begin(); it != strategyKeyMap.end(); it++) {
-        atb_speed::common::ParallelInfo parallelInfo = atb_speed::common::ParallelInfo();
-        const nlohmann::json &curParamJson = paramJson[it->second];
-        parallelInfo.rank = FetchJsonParam<uint32_t>(curParamJson, "rank");
-        parallelInfo.rankIds = FetchJsonParam<std::vector<uint32_t>>(curParamJson["rankIds"], "rankIds", true);
-        parallelInfo.bufferSize = FetchJsonParam<uint32_t>(curParamJson, "bufferSize");
-        parallelInfo.groupId = FetchJsonParam<uint32_t>(curParamJson, "groupId");
-        this->Register(it->first, parallelInfo);
+        this->Register(it->first, parseParallelInfo(paramJson[it->second]));
     }
     // KV-split group (independent from token-CP). Emitted by xLLM MappingNPU as
     // "kvSplit". When absent (legacy mapping JSON) SparseLatentAttention keeps
     // using contextParallelInfo for the prefix AllGather.
     if (paramJson.contains("kvSplit")) {
-        atb_speed::common::ParallelInfo kvSplitInfo = atb_speed::common::ParallelInfo();
-        const nlohmann::json &kvSplitJson = paramJson["kvSplit"];
-        kvSplitInfo.rank = FetchJsonParam<uint32_t>(kvSplitJson, "rank");
-        kvSplitInfo.rankIds =
-            FetchJsonParam<std::vector<uint32_t>>(kvSplitJson["rankIds"], "rankIds", true);
-        kvSplitInfo.bufferSize = FetchJsonParam<uint32_t>(kvSplitJson, "bufferSize");
-        kvSplitInfo.groupId = FetchJsonParam<uint32_t>(kvSplitJson, "groupId");
-        this->Register(ATTN_KV_SPLIT, kvSplitInfo);
+        this->Register(ATTN_KV_SPLIT, parseParallelInfo(paramJson["kvSplit"]));
+    }
+    if (paramJson.contains("attnLayerwiseSplit")) {
+        this->Register(ATTN_LAYERWISE_SPLIT, parseParallelInfo(paramJson["attnLayerwiseSplit"]));
     }
 }
 

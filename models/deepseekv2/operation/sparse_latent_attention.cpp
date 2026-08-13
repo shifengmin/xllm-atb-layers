@@ -25,7 +25,6 @@
 #include "operations/aclnn/ops/sparse_flash_attention_operation.h"
 #include "operations/aclnn/ops/mla_preprocess_v2_operation.h"
 #include <operations/aclnn/ops/multi_latent_attention.h>
-#include "operations/fusion/utils.h"
 #include "models/deepseekv2/operation/fa_update.h"
 #include "models/deepseekv2/operation/ring_attention.h"
 #include "models/deepseekv2/operation/sparse_latent_attention.h"
@@ -80,6 +79,50 @@ bool EnableFA3Quant(const LatentAttentionParam<NormParamType> &param)
 {
     return param.pageAttentionParam.quantType == \
         atb::infer::PagedAttentionParam::QuantType::TYPE_QUANT_QKV_ONLINE;
+}
+
+template <typename NormParamType>
+bool LayerwiseSplitEnabled(const LatentAttentionParam<NormParamType> &param)
+{
+    return param.layerwiseSplitInfo.IsEnabled();
+}
+
+template <typename NormParamType>
+uint32_t LayerwiseSplitOwnerRank(const LatentAttentionParam<NormParamType> &param)
+{
+    CHECK(LayerwiseSplitEnabled(param));
+    CHECK(!param.layerwiseSplitInfo.rankIds.empty());
+    return static_cast<uint32_t>(
+        param.layerId % static_cast<int>(param.layerwiseSplitInfo.rankIds.size()));
+}
+
+template <typename NormParamType>
+bool IsLayerwiseSplitOwner(const LatentAttentionParam<NormParamType> &param)
+{
+    return LayerwiseSplitEnabled(param) &&
+        param.layerwiseSplitInfo.rank == LayerwiseSplitOwnerRank(param);
+}
+
+void FillHcclAllGatherParam(
+    const atb_speed::common::ParallelInfo &info,
+    atb::infer::AllGatherParam &allGatherParam)
+{
+    allGatherParam.rank = info.rank;
+    allGatherParam.rankSize = static_cast<uint32_t>(info.rankIds.size());
+    allGatherParam.backend = info.defaultBackend;
+    info.InitCommDomain(allGatherParam.hcclComm, allGatherParam.commDomain);
+}
+
+void FillHcclBroadcastParam(
+    const atb_speed::common::ParallelInfo &info,
+    uint32_t rankRoot,
+    atb::infer::BroadcastParam &broadcastParam)
+{
+    broadcastParam.rank = info.rank;
+    broadcastParam.rankSize = static_cast<uint32_t>(info.rankIds.size());
+    broadcastParam.rankRoot = rankRoot;
+    broadcastParam.backend = info.defaultBackend;
+    info.InitCommDomain(broadcastParam.hcclComm, broadcastParam.commDomain);
 }
 
 std::map<std::string, std::vector<std::string>> GetLatentAttnInTensorCandidates()
@@ -237,6 +280,14 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
         {"cp_prefixcache_allgather_indexer", {
             "prefix_indexer_k_allgather"
         }},
+        {"layerwise_split", {
+            "layerwise_split_q_packed_local", "layerwise_split_q_packed_rank_major",
+            "layerwise_split_attention_output"
+        }},
+        {"layerwise_split_owner", {
+            "layerwise_split_q_packed_token_major", "layerwise_split_q_nope_owner",
+            "layerwise_split_q_rope_owner"
+        }},
     };
     return latentAttnIntermediateTensorCandidates;
 }
@@ -277,9 +328,14 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
         AddTensorToList(latentAttnIntermediateTensorCandidates, !param.enablePreprocessLcocTp ? \
             "qkvdown_dp" : "enable_preprocess_lcoc_tp", intermediateTensorList);
     }
+    const bool buildsLocalIndexer =
+        !LayerwiseSplitEnabled(param) || IsLayerwiseSplitOwner(param);
     if (param.enableMlaPreprocess && !param.isPrefill) {
         AddTensorToList(latentAttnIntermediateTensorCandidates, "mla_preprocess", intermediateTensorList);
-        if (param.skipTopk) {
+        // The fused preprocess always emits the indexer norm, so declare it
+        // even on a rank that never builds the indexer chain: a top-k sharing
+        // consumer, or a layerwise non-owner.
+        if (param.skipTopk || !buildsLocalIndexer) {
             AddTensorToList(latentAttnIntermediateTensorCandidates, "indexer_skipped", intermediateTensorList);
         }
     } else {
@@ -301,13 +357,21 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
             AddTensorToList(latentAttnIntermediateTensorCandidates, "decode", intermediateTensorList);
         }
     }
-    if (!param.skipTopk) {
+    if (!param.skipTopk && buildsLocalIndexer) {
         AddTensorToList(latentAttnIntermediateTensorCandidates, "indexer", intermediateTensorList);
         if (!param.outputTopk) {
             intermediateTensorList.push_back("intermediate_topk_indices");
         }
-    } else {
+    }
+    if (param.skipTopk) {
         AddTensorToList(latentAttnInTensorCandidates, "topk_share", inTensorList);
+    }
+    if (LayerwiseSplitEnabled(param)) {
+        AddTensorToList(latentAttnIntermediateTensorCandidates, "layerwise_split", intermediateTensorList);
+        if (IsLayerwiseSplitOwner(param)) {
+            AddTensorToList(latentAttnIntermediateTensorCandidates,
+                "layerwise_split_owner", intermediateTensorList);
+        }
     }
     AddTensorToList(latentAttnIntermediateTensorCandidates, "ein_reproj", intermediateTensorList);
     // using MATMUL_EIN_SUM, skip trans
@@ -1874,6 +1938,7 @@ atb::Status AddLightIndexerNode(const LatentAttentionParam<NormParamType> &param
 {
     atb::Node lightIndexerNode;
     atb_speed::common::LightningIndexerParam lightIndexerParam;
+    lightIndexerParam.selectedCount = param.index_topk;
     lightIndexerNode.operation = new atb_speed::common::LightningIndexerOperation(
         "AclNNLightningIndexerNode", lightIndexerParam
     );
@@ -1885,11 +1950,187 @@ atb::Status AddLightIndexerNode(const LatentAttentionParam<NormParamType> &param
         GetTensorIdx(tensorMap, "in_seq_len"),
         GetTensorIdx(tensorMap, "in_block_tables"),
     };
-    lightIndexerNode.outTensorIds = {GetTensorIdx(
-        tensorMap,
-        param.outputTopk ? "out_topk_indices" : "intermediate_topk_indices")};
+    std::string topkOutput = "intermediate_topk_indices";
+    if (param.outputTopk) {
+        topkOutput = "out_topk_indices";
+    }
+    lightIndexerNode.outTensorIds = {GetTensorIdx(tensorMap, topkOutput)};
     opGraph.nodes.push_back(lightIndexerNode);
     ATB_SPEED_LOG_DEBUG("LightningIndexer calculation success");
+    return atb::NO_ERROR;
+}
+
+template <typename ReshapeFunc>
+atb::Status AddLayerwiseSplitSliceAllocNode(
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap,
+    const std::string &input,
+    const std::string &output,
+    int64_t lastDim,
+    ReshapeFunc reshapeFunc)
+{
+    atb::Node sliceNode;
+    atb::infer::SliceParam sliceParam;
+    sliceParam.offsets = {0, 0, 0};
+    sliceParam.size = {-1, -1, lastDim};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(sliceParam, &sliceNode.operation));
+    sliceNode.inTensorIds = GetTensorIdxList(tensorMap, {input});
+    sliceNode.outTensorIds = GetTensorIdxList(tensorMap, {output});
+    sliceNode.inTensorReshapeFuncs.resize(sliceNode.inTensorIds.size());
+    sliceNode.inTensorReshapeFuncs[0] = reshapeFunc;
+    opGraph.nodes.push_back(sliceNode);
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddLayerwiseSplitBroadcastNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap,
+    const std::string &input)
+{
+    atb::Node broadcastNode;
+    atb::infer::BroadcastParam broadcastParam;
+    FillHcclBroadcastParam(
+        param.layerwiseSplitInfo, LayerwiseSplitOwnerRank(param), broadcastParam);
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(broadcastParam, &broadcastNode.operation));
+    broadcastNode.inTensorIds = GetTensorIdxList(tensorMap, {input});
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsBeforeComm(opGraph));
+    opGraph.nodes.push_back(broadcastNode);
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsAfterComm(opGraph));
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddLayerwiseSplitQAllGatherNodes(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    const bool useMlaPreprocess =
+        param.qLoraRank > 0 && param.enableMlaPreprocess && !param.isPrefill;
+    const std::string qNope = useMlaPreprocess ?
+        "intermediate_q_nope" : "intermediate_q_t";
+    const std::string qRope = useMlaPreprocess ?
+        "intermediate_q_rope" : "rope_q_o";
+
+    atb::Node qPackNode;
+    atb::infer::ConcatParam qPackParam;
+    qPackParam.concatDim = 2;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(qPackParam, &qPackNode.operation));
+    qPackNode.inTensorIds = GetTensorIdxList(tensorMap, {qNope, qRope});
+    qPackNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"layerwise_split_q_packed_local"});
+    if (!useMlaPreprocess) {
+        qPackNode.inTensorReshapeFuncs.resize(qPackNode.inTensorIds.size());
+        qPackNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape,
+                                                atb::Dims &newShape) {
+            UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
+        };
+    }
+    opGraph.nodes.push_back(qPackNode);
+
+    atb::Node allGatherNode;
+    atb::infer::AllGatherParam allGatherParam;
+    FillHcclAllGatherParam(param.layerwiseSplitInfo, allGatherParam);
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(allGatherParam, &allGatherNode.operation));
+    allGatherNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"layerwise_split_q_packed_local"});
+    allGatherNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"layerwise_split_q_packed_rank_major"});
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsBeforeComm(opGraph));
+    opGraph.nodes.push_back(allGatherNode);
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsAfterComm(opGraph));
+    return atb::NO_ERROR;
+}
+
+// Owner restores token-major order before merging the gathered head shards.
+template <typename NormParamType>
+atb::Status AddLayerwiseSplitQOwnerReorderNodes(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    CHECK(IsLayerwiseSplitOwner(param));
+    atb::Node transposeNode;
+    atb::infer::TransposeParam transposeParam;
+    transposeParam.perm = {1, 0, 2, 3};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(transposeParam, &transposeNode.operation));
+    transposeNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"layerwise_split_q_packed_rank_major"});
+    transposeNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"layerwise_split_q_packed_token_major"});
+    opGraph.nodes.push_back(transposeNode);
+
+    atb::Node splitNode;
+    atb::infer::SplitParam splitParam = {
+        2, 2, {param.kvLoraRank, param.qkRopeHeadDim}};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(splitParam, &splitNode.operation));
+    splitNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"layerwise_split_q_packed_token_major"});
+    splitNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"layerwise_split_q_nope_owner", "layerwise_split_q_rope_owner"});
+    splitNode.inTensorReshapeFuncs.resize(splitNode.inTensorIds.size());
+    splitNode.inTensorReshapeFuncs[0] = [](const atb::Dims &oldShape,
+                                          atb::Dims &newShape) {
+        newShape.dimNum = 3;
+        newShape.dims[0] = oldShape.dims[0];
+        newShape.dims[1] = oldShape.dims[1] * oldShape.dims[2];
+        newShape.dims[2] = oldShape.dims[3];
+    };
+    opGraph.nodes.push_back(splitNode);
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddLayerwiseSplitOutputBroadcastNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    if (!IsLayerwiseSplitOwner(param)) {
+        // Non-owner never runs SFA. Slice the gathered Q packed tensor so ATB
+        // infers [T, layerwise_split_heads, kv_lora] and allocates the in-place Broadcast
+        // receive buffer. Content is discarded.
+        CHECK_OPERATION_STATUS_RETURN(AddLayerwiseSplitSliceAllocNode(
+            opGraph,
+            tensorMap,
+            "layerwise_split_q_packed_rank_major",
+            "layerwise_split_attention_output",
+            static_cast<int64_t>(param.kvLoraRank),
+            [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+                CHECK_EQ(oldShape.dimNum, 4);
+                CHECK_GE(oldShape.dims[3], param.kvLoraRank);
+                newShape.dimNum = 3;
+                newShape.dims[0] = oldShape.dims[1];
+                newShape.dims[1] = oldShape.dims[0] * oldShape.dims[2];
+                newShape.dims[2] = oldShape.dims[3];
+            }));
+    }
+    CHECK_OPERATION_STATUS_RETURN(AddLayerwiseSplitBroadcastNode(
+        param, opGraph, tensorMap, "layerwise_split_attention_output"));
+
+    atb::Node sliceNode;
+    atb::infer::SliceParam sliceParam;
+    sliceParam.offsets = {
+        0,
+        static_cast<int64_t>(param.layerwiseSplitInfo.rank) *
+            param.selfAttentionParam.headNum,
+        0};
+    sliceParam.size = {-1, param.selfAttentionParam.headNum, -1};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(sliceParam, &sliceNode.operation));
+    sliceNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"layerwise_split_attention_output"});
+    sliceNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"intermediate_self_attention"});
+    opGraph.nodes.push_back(sliceNode);
     return atb::NO_ERROR;
 }
 
@@ -1908,9 +2149,12 @@ atb::Status AddSparseFlashAttentionNode(
     sparseFlashAttentionNode.operation = new atb_speed::common::SparseFlashAttentionOperation(
         "AclNNSparseFlashAttentionNode", sparseFlashAttentionParam
     );
-    auto q_nope = ""; 
-    auto q_pe = ""; 
-    if (param.isPrefill || !param.enableMlaPreprocess) {
+    auto q_nope = "";
+    auto q_pe = "";
+    if (LayerwiseSplitEnabled(param)) {
+        q_nope = "layerwise_split_q_nope_owner";
+        q_pe = "layerwise_split_q_rope_owner";
+    } else if (param.isPrefill || !param.enableMlaPreprocess) {
         q_nope = "intermediate_q_t";
         q_pe = "rope_q_o";
     } else {
@@ -1932,8 +2176,12 @@ atb::Status AddSparseFlashAttentionNode(
         GetTensorIdx(tensorMap, q_pe),
         GetTensorIdx(tensorMap, "in_k_rope_cache"),
     };
-    sparseFlashAttentionNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_self_attention")};
-    if (param.isPrefill || !param.enableMlaPreprocess) {
+    const std::string output = LayerwiseSplitEnabled(param)
+        ? "layerwise_split_attention_output"
+        : "intermediate_self_attention";
+    sparseFlashAttentionNode.outTensorIds = {GetTensorIdx(tensorMap, output)};
+    if (!LayerwiseSplitEnabled(param) &&
+        (param.isPrefill || !param.enableMlaPreprocess)) {
         sparseFlashAttentionNode.inTensorReshapeFuncs.resize(sparseFlashAttentionNode.inTensorIds.size());
         sparseFlashAttentionNode.inTensorReshapeFuncs[7] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
             UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
@@ -2100,7 +2348,14 @@ atb::Status AddReprojVTransposeNode(const LatentAttentionParam<NormParamType> &p
 template <typename NormParamType>
 atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
     atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
-{   
+{
+    const bool layerwiseSplit = LayerwiseSplitEnabled(param);
+    const bool isLayerwiseSplitOwner = IsLayerwiseSplitOwner(param);
+    if (layerwiseSplit) {
+        CHECK(param.reshapeCacheParm.kvCacheCfg ==
+              atb::infer::ReshapeAndCacheParam::KvCacheCfg::K_CACHE_V_CACHE)
+            << "Layerwise split requires an ND key/value cache layout.";
+    }
     const bool useMlaPreprocess = param.qLoraRank > 0 && param.enableMlaPreprocess && !param.isPrefill;
     if (useMlaPreprocess) {
         CHECK_OPERATION_STATUS_RETURN(AddMlaPreprocessV2Node(param, opGraph, tensorMap));
@@ -2110,7 +2365,7 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
         // CHECK_OPERATION_STATUS_RETURN(AddLAttnQNormRecalNode(param, opGraph, tensorMap));
     } else {
         CHECK_OPERATION_STATUS_RETURN(AddLAttnPreNormNode(param, opGraph, tensorMap));
-        if (param.qLoraRank > 0 && param.enablePreprocessLcocTp) {
+        if (param.qLoraRank > 0 && param.enablePreprocessLcocTp && !layerwiseSplit) {
             CHECK_OPERATION_STATUS_RETURN(AddLAttnKVAProjNode(param, opGraph, tensorMap));
             CHECK_OPERATION_STATUS_RETURN(SetTPAllGatherNode(param, opGraph, tensorMap));
             CHECK_OPERATION_STATUS_RETURN(SetFFNUnPadding(param, opGraph, tensorMap));
@@ -2122,7 +2377,7 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
             CHECK_OPERATION_STATUS_RETURN(AddSplitQNode(param, opGraph, tensorMap));
         } else if (param.qLoraRank > 0) {
             CHECK_OPERATION_STATUS_RETURN(AddLAttnQKVProjNode(param, opGraph, tensorMap));
-            if (param.enableQkvdownDp) {
+            if (param.enableQkvdownDp && !layerwiseSplit) {
                 CHECK_OPERATION_STATUS_RETURN(SetTPAllGatherNode(param, opGraph, tensorMap));
                 CHECK_OPERATION_STATUS_RETURN(SetFFNUnPadding(param, opGraph, tensorMap));
             }
@@ -2156,9 +2411,12 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
         if (param.isPrefill || !param.enableMlaPreprocess) {
             CHECK_OPERATION_STATUS_RETURN(PreprocessKV(param, opGraph, tensorMap));
         }
-        CHECK_OPERATION_STATUS_RETURN(AddReshapeAndCacheNode(param, opGraph, tensorMap));
+        if (!layerwiseSplit || isLayerwiseSplitOwner) {
+            CHECK_OPERATION_STATUS_RETURN(AddReshapeAndCacheNode(param, opGraph, tensorMap));
+        }
     }
-    if (!param.skipTopk) {
+    const bool runIndexer = !param.skipTopk && (!layerwiseSplit || isLayerwiseSplitOwner);
+    if (runIndexer) {
         // indexer
         if (!useMlaPreprocess) {
             CHECK_OPERATION_STATUS_RETURN(AddLAttnQNormRecalNode(param, opGraph, tensorMap));
@@ -2238,7 +2496,7 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
         }
     }
 
-    if (!param.skipTopk) {
+    if (runIndexer) {
         CHECK_OPERATION_STATUS_RETURN(AddIndexerWeightNode(param, opGraph, tensorMap));
     }
 
@@ -2269,8 +2527,20 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
         std::string topk_output = param.outputTopk ? "out_topk_indices" : "intermediate_topk_indices";
         CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
             "intermediate_topk_indices_draft", topk_output, "cp_o_recover_idx"));
-    } else if (!param.skipTopk) {
+    } else if (runIndexer) {
         CHECK_OPERATION_STATUS_RETURN(AddLightIndexerNode(param, opGraph, tensorMap));
+    }
+    if (layerwiseSplit) {
+        if (param.outputTopk) {
+            CHECK_OPERATION_STATUS_RETURN(AddLayerwiseSplitBroadcastNode(
+                param, opGraph, tensorMap, "out_topk_indices"));
+        }
+        CHECK_OPERATION_STATUS_RETURN(
+            AddLayerwiseSplitQAllGatherNodes(param, opGraph, tensorMap));
+        if (isLayerwiseSplitOwner) {
+            CHECK_OPERATION_STATUS_RETURN(
+                AddLayerwiseSplitQOwnerReorderNodes(param, opGraph, tensorMap));
+        }
     }
     return atb::NO_ERROR;
 }
@@ -2291,12 +2561,17 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
     // Preprocess
     CHECK_OPERATION_STATUS_RETURN(sparse::Preprocess(param, opGraph, tensorMap));
     // PA or MLA
-    
-    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
-    // CP Attention
+    if (sparse::LayerwiseSplitEnabled(param)) {
+        if (sparse::IsLayerwiseSplitOwner(param)) {
+            CHECK_OPERATION_STATUS_RETURN(
+                sparse::AddSparseFlashAttentionNode(param, opGraph, tensorMap));
+        }
+        CHECK_OPERATION_STATUS_RETURN(
+            sparse::AddLayerwiseSplitOutputBroadcastNode(param, opGraph, tensorMap));
+    } else if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+        // CP Attention
         CHECK_OPERATION_STATUS_RETURN(sparse::AddSparseFlashAttentionCpNode(param, opGraph, tensorMap));
-    }
-    else {
+    } else {
         CHECK_OPERATION_STATUS_RETURN(sparse::AddSparseFlashAttentionNode(param, opGraph, tensorMap));
     }
     // CHECK_OPERATION_STATUS_RETURN(sparse::AddsfaTransposeNode(param, opGraph, tensorMap)); 
@@ -2322,8 +2597,7 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
             outTensorDescs.at(1).dtype = ACL_INT32;
             outTensorDescs.at(1).shape.dimNum = 3;
             outTensorDescs.at(1).shape.dims[0] = inTensorDescs.at(0).shape.dims[0];
-            outTensorDescs.at(1).shape.dims[1] = inTensorDescs.at(
-                atb_speed::common::GetTensorIdx(tensorMap, "in_k_cache_indexer")).shape.dims[2];
+            outTensorDescs.at(1).shape.dims[1] = 1;
             outTensorDescs.at(1).shape.dims[2] = param.index_topk;
         }
         return atb::NO_ERROR;
