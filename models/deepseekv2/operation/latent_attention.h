@@ -67,6 +67,14 @@ struct LatentAttentionParam {
     int index_topk = 0; // 2048
     bool skipTopk = false;
     bool outputTopk = false;
+    bool enableDecodeDcpLayerOwner = false;
+    // Prefill counterpart of layerwise KV cache: the layer owner materializes
+    // the history of this layer into every non-owner's shared scratch cache so
+    // the rest of the prefill graph runs unchanged on both roles.
+    bool enableLayerwisePrefillHistory = false;
+    bool isDecodeDcpOwner = false;
+    int decodeDcpOwnerRank = 0;
+    atb_speed::common::ParallelInfo decodeDcpInfo;
 
     int packQuantType = atb_speed::common::PackQuantType::ALL_FP;
     // Compatibility vector: entries may be legacy LinearType or new LinearDesc.

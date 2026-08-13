@@ -25,7 +25,6 @@
 #include "operations/aclnn/ops/sparse_flash_attention_operation.h"
 #include "operations/aclnn/ops/mla_preprocess_v2_operation.h"
 #include <operations/aclnn/ops/multi_latent_attention.h>
-#include "operations/fusion/utils.h"
 #include "models/deepseekv2/operation/fa_update.h"
 #include "models/deepseekv2/operation/ring_attention.h"
 #include "models/deepseekv2/operation/sparse_latent_attention.h"
@@ -143,6 +142,13 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnInTensorCandidates(
         {"qkvdown_dp", {"in_ffn_unpadding_idx"}
         },
         {"topk_share", {"in_shared_topk_indices"}},
+        {"decode_dcp", {
+            "in_dcp_attention_output_buffer"}},
+        {"decode_dcp_topk", {
+            "in_dcp_topk_receive_buffer"}},
+        {"layerwise_prefill", {
+            "in_lw_history_slots", "in_lw_history_kv_buffer",
+            "in_lw_history_indexer_buffer"}},
         {"cp_prefixcache", {
             "in_prefix_slots"
         }},
@@ -237,6 +243,23 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
         {"cp_prefixcache_allgather_indexer", {
             "prefix_indexer_k_allgather"
         }},
+        {"decode_dcp", {
+            "dcp_q_packed_local", "dcp_q_packed_rank_major",
+            "dcp_attention_output"
+        }},
+        {"decode_dcp_topk", {"dcp_shared_topk"}},
+        {"decode_dcp_owner", {
+            "dcp_q_packed_token_major", "dcp_q_nope_owner",
+            "dcp_q_rope_owner", "dcp_attention_output_owner"
+        }},
+        {"decode_dcp_owner_topk", {"dcp_raw_topk"}},
+        {"layerwise_prefill", {"lw_history_kv", "lw_history_indexer"}},
+        {"layerwise_prefill_owner", {
+            "lw_history_latent_local", "lw_history_rope_local"
+        }},
+        {"layerwise_prefill_non_owner", {
+            "lw_history_latent", "lw_history_rope"
+        }},
     };
     return latentAttnIntermediateTensorCandidates;
 }
@@ -277,9 +300,14 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
         AddTensorToList(latentAttnIntermediateTensorCandidates, !param.enablePreprocessLcocTp ? \
             "qkvdown_dp" : "enable_preprocess_lcoc_tp", intermediateTensorList);
     }
+    const bool buildsLocalIndexer =
+        !param.enableDecodeDcpLayerOwner || param.isDecodeDcpOwner;
     if (param.enableMlaPreprocess && !param.isPrefill) {
         AddTensorToList(latentAttnIntermediateTensorCandidates, "mla_preprocess", intermediateTensorList);
-        if (param.skipTopk) {
+        // The fused preprocess always emits the indexer norm, so declare it
+        // even on a rank that never builds the indexer chain: a top-k sharing
+        // consumer, or a layerwise non-owner.
+        if (param.skipTopk || !buildsLocalIndexer) {
             AddTensorToList(latentAttnIntermediateTensorCandidates, "indexer_skipped", intermediateTensorList);
         }
     } else {
@@ -301,13 +329,40 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
             AddTensorToList(latentAttnIntermediateTensorCandidates, "decode", intermediateTensorList);
         }
     }
-    if (!param.skipTopk) {
+    if (!param.skipTopk && buildsLocalIndexer) {
         AddTensorToList(latentAttnIntermediateTensorCandidates, "indexer", intermediateTensorList);
         if (!param.outputTopk) {
             intermediateTensorList.push_back("intermediate_topk_indices");
         }
-    } else {
+    }
+    if (param.skipTopk) {
         AddTensorToList(latentAttnInTensorCandidates, "topk_share", inTensorList);
+    }
+    if (param.enableLayerwisePrefillHistory && param.isPrefill) {
+        AddTensorToList(latentAttnInTensorCandidates, "layerwise_prefill", inTensorList);
+        AddTensorToList(latentAttnIntermediateTensorCandidates,
+            "layerwise_prefill", intermediateTensorList);
+        AddTensorToList(latentAttnIntermediateTensorCandidates,
+            param.isDecodeDcpOwner ? "layerwise_prefill_owner"
+                                   : "layerwise_prefill_non_owner",
+            intermediateTensorList);
+    }
+    if (param.enableDecodeDcpLayerOwner) {
+        AddTensorToList(latentAttnInTensorCandidates, "decode_dcp", inTensorList);
+        AddTensorToList(latentAttnIntermediateTensorCandidates, "decode_dcp", intermediateTensorList);
+        if (param.outputTopk) {
+            AddTensorToList(latentAttnInTensorCandidates, "decode_dcp_topk", inTensorList);
+            AddTensorToList(latentAttnIntermediateTensorCandidates,
+                "decode_dcp_topk", intermediateTensorList);
+        }
+        if (param.isDecodeDcpOwner) {
+            AddTensorToList(latentAttnIntermediateTensorCandidates,
+                "decode_dcp_owner", intermediateTensorList);
+        }
+        if (param.isDecodeDcpOwner && param.outputTopk) {
+            AddTensorToList(latentAttnIntermediateTensorCandidates,
+                "decode_dcp_owner_topk", intermediateTensorList);
+        }
     }
     AddTensorToList(latentAttnIntermediateTensorCandidates, "ein_reproj", intermediateTensorList);
     // using MATMUL_EIN_SUM, skip trans
@@ -1874,6 +1929,7 @@ atb::Status AddLightIndexerNode(const LatentAttentionParam<NormParamType> &param
 {
     atb::Node lightIndexerNode;
     atb_speed::common::LightningIndexerParam lightIndexerParam;
+    lightIndexerParam.selectedCount = param.index_topk;
     lightIndexerNode.operation = new atb_speed::common::LightningIndexerOperation(
         "AclNNLightningIndexerNode", lightIndexerParam
     );
@@ -1885,11 +1941,199 @@ atb::Status AddLightIndexerNode(const LatentAttentionParam<NormParamType> &param
         GetTensorIdx(tensorMap, "in_seq_len"),
         GetTensorIdx(tensorMap, "in_block_tables"),
     };
-    lightIndexerNode.outTensorIds = {GetTensorIdx(
-        tensorMap,
-        param.outputTopk ? "out_topk_indices" : "intermediate_topk_indices")};
+    std::string topkOutput = "intermediate_topk_indices";
+    if (param.enableDecodeDcpLayerOwner && param.outputTopk) {
+        topkOutput = "dcp_raw_topk";
+    } else if (param.outputTopk) {
+        topkOutput = "out_topk_indices";
+    }
+    lightIndexerNode.outTensorIds = {GetTensorIdx(tensorMap, topkOutput)};
     opGraph.nodes.push_back(lightIndexerNode);
     ATB_SPEED_LOG_DEBUG("LightningIndexer calculation success");
+    return atb::NO_ERROR;
+}
+
+atb::Status AddDecodeDcpCopyNode(
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap,
+    const std::string &input,
+    const std::string &output)
+{
+    atb::Node copyNode;
+    atb::infer::SliceParam copyParam;
+    copyParam.offsets = {0, 0, 0};
+    copyParam.size = {-1, -1, -1};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(copyParam, &copyNode.operation));
+    copyNode.inTensorIds = GetTensorIdxList(tensorMap, {input});
+    copyNode.outTensorIds = GetTensorIdxList(tensorMap, {output});
+    opGraph.nodes.push_back(copyNode);
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddDecodeDcpBroadcastNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap,
+    const std::string &input)
+{
+    atb::Node broadcastNode;
+    atb::infer::BroadcastParam broadcastParam;
+    broadcastParam.rank = param.decodeDcpInfo.rank;
+    broadcastParam.rankSize =
+        static_cast<uint32_t>(param.decodeDcpInfo.rankIds.size());
+    broadcastParam.rankRoot =
+        static_cast<uint32_t>(param.decodeDcpOwnerRank);
+    broadcastParam.backend = param.decodeDcpInfo.defaultBackend;
+    param.decodeDcpInfo.InitCommDomain(
+        broadcastParam.hcclComm, broadcastParam.commDomain);
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(broadcastParam, &broadcastNode.operation));
+    broadcastNode.inTensorIds = GetTensorIdxList(tensorMap, {input});
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsBeforeComm(opGraph));
+    opGraph.nodes.push_back(broadcastNode);
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsAfterComm(opGraph));
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddDecodeDcpTopkBroadcastNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    CHECK(param.outputTopk);
+    const std::string source = param.isDecodeDcpOwner
+        ? "dcp_raw_topk"
+        : "in_dcp_topk_receive_buffer";
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpCopyNode(
+        opGraph, tensorMap, source, "dcp_shared_topk"));
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpBroadcastNode(
+        param, opGraph, tensorMap, "dcp_shared_topk"));
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpCopyNode(
+        opGraph, tensorMap, "dcp_shared_topk", "out_topk_indices"));
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddDecodeDcpQAllGatherNodes(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    const bool useMlaPreprocess = param.qLoraRank > 0 && param.enableMlaPreprocess;
+    const std::string qNope = useMlaPreprocess ?
+        "intermediate_q_nope" : "intermediate_q_t";
+    const std::string qRope = useMlaPreprocess ?
+        "intermediate_q_rope" : "rope_q_o";
+
+    atb::Node qPackNode;
+    atb::infer::ConcatParam qPackParam;
+    qPackParam.concatDim = 2;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(qPackParam, &qPackNode.operation));
+    qPackNode.inTensorIds = GetTensorIdxList(tensorMap, {qNope, qRope});
+    qPackNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_q_packed_local"});
+    if (!useMlaPreprocess) {
+        qPackNode.inTensorReshapeFuncs.resize(qPackNode.inTensorIds.size());
+        qPackNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape,
+                                                atb::Dims &newShape) {
+            UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
+        };
+    }
+    opGraph.nodes.push_back(qPackNode);
+
+    atb::Node allGatherNode;
+    atb::infer::AllGatherParam allGatherParam;
+    allGatherParam.rank = param.decodeDcpInfo.rank;
+    allGatherParam.rankSize =
+        static_cast<uint32_t>(param.decodeDcpInfo.rankIds.size());
+    allGatherParam.backend = param.decodeDcpInfo.defaultBackend;
+    param.decodeDcpInfo.InitCommDomain(
+        allGatherParam.hcclComm, allGatherParam.commDomain);
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(allGatherParam, &allGatherNode.operation));
+    allGatherNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_q_packed_local"});
+    allGatherNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_q_packed_rank_major"});
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsBeforeComm(opGraph));
+    opGraph.nodes.push_back(allGatherNode);
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsAfterComm(opGraph));
+    return atb::NO_ERROR;
+}
+
+// Owner restores token-major order before merging the gathered head shards.
+template <typename NormParamType>
+atb::Status AddDecodeDcpQOwnerReorderNodes(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    CHECK(param.isDecodeDcpOwner);
+    atb::Node transposeNode;
+    atb::infer::TransposeParam transposeParam;
+    transposeParam.perm = {1, 0, 2, 3};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(transposeParam, &transposeNode.operation));
+    transposeNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_q_packed_rank_major"});
+    transposeNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_q_packed_token_major"});
+    opGraph.nodes.push_back(transposeNode);
+
+    atb::Node splitNode;
+    atb::infer::SplitParam splitParam = {
+        2, 2, {param.kvLoraRank, param.qkRopeHeadDim}};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(splitParam, &splitNode.operation));
+    splitNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_q_packed_token_major"});
+    splitNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_q_nope_owner", "dcp_q_rope_owner"});
+    splitNode.inTensorReshapeFuncs.resize(splitNode.inTensorIds.size());
+    splitNode.inTensorReshapeFuncs[0] = [](const atb::Dims &oldShape,
+                                          atb::Dims &newShape) {
+        newShape.dimNum = 3;
+        newShape.dims[0] = oldShape.dims[0];
+        newShape.dims[1] = oldShape.dims[1] * oldShape.dims[2];
+        newShape.dims[2] = oldShape.dims[3];
+    };
+    opGraph.nodes.push_back(splitNode);
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddDecodeDcpOutputBroadcastNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    const std::string source = param.isDecodeDcpOwner
+        ? "dcp_attention_output_owner"
+        : "in_dcp_attention_output_buffer";
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpCopyNode(
+        opGraph, tensorMap, source, "dcp_attention_output"));
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpBroadcastNode(
+        param, opGraph, tensorMap, "dcp_attention_output"));
+
+    atb::Node sliceNode;
+    atb::infer::SliceParam sliceParam;
+    sliceParam.offsets = {
+        0,
+        static_cast<int64_t>(param.decodeDcpInfo.rank) *
+            param.selfAttentionParam.headNum,
+        0};
+    sliceParam.size = {-1, param.selfAttentionParam.headNum, -1};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(sliceParam, &sliceNode.operation));
+    sliceNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"dcp_attention_output"});
+    sliceNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"intermediate_self_attention"});
+    opGraph.nodes.push_back(sliceNode);
     return atb::NO_ERROR;
 }
 
@@ -1908,9 +2152,12 @@ atb::Status AddSparseFlashAttentionNode(
     sparseFlashAttentionNode.operation = new atb_speed::common::SparseFlashAttentionOperation(
         "AclNNSparseFlashAttentionNode", sparseFlashAttentionParam
     );
-    auto q_nope = ""; 
-    auto q_pe = ""; 
-    if (param.isPrefill || !param.enableMlaPreprocess) {
+    auto q_nope = "";
+    auto q_pe = "";
+    if (param.enableDecodeDcpLayerOwner) {
+        q_nope = "dcp_q_nope_owner";
+        q_pe = "dcp_q_rope_owner";
+    } else if (param.isPrefill || !param.enableMlaPreprocess) {
         q_nope = "intermediate_q_t";
         q_pe = "rope_q_o";
     } else {
@@ -1919,8 +2166,10 @@ atb::Status AddSparseFlashAttentionNode(
     }
     std::string topk_indices =
         param.skipTopk ? "in_shared_topk_indices"
-                       : (param.outputTopk ? "out_topk_indices"
-                                           : "intermediate_topk_indices");
+                       : (param.enableDecodeDcpLayerOwner && param.outputTopk
+                              ? "dcp_raw_topk"
+                              : (param.outputTopk ? "out_topk_indices"
+                                                  : "intermediate_topk_indices"));
     sparseFlashAttentionNode.inTensorIds = {
         GetTensorIdx(tensorMap, q_nope),
         GetTensorIdx(tensorMap, "in_k_cache"),
@@ -1932,8 +2181,12 @@ atb::Status AddSparseFlashAttentionNode(
         GetTensorIdx(tensorMap, q_pe),
         GetTensorIdx(tensorMap, "in_k_rope_cache"),
     };
-    sparseFlashAttentionNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_self_attention")};
-    if (param.isPrefill || !param.enableMlaPreprocess) {
+    const std::string output = param.enableDecodeDcpLayerOwner
+        ? "dcp_attention_output_owner"
+        : "intermediate_self_attention";
+    sparseFlashAttentionNode.outTensorIds = {GetTensorIdx(tensorMap, output)};
+    if (!param.enableDecodeDcpLayerOwner &&
+        (param.isPrefill || !param.enableMlaPreprocess)) {
         sparseFlashAttentionNode.inTensorReshapeFuncs.resize(sparseFlashAttentionNode.inTensorIds.size());
         sparseFlashAttentionNode.inTensorReshapeFuncs[7] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
             UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
@@ -2097,10 +2350,197 @@ atb::Status AddReprojVTransposeNode(const LatentAttentionParam<NormParamType> &p
 }
 
 
+// Layerwise KV cache prefill: only the layer owner keeps this layer's history,
+// so it reads the rows the batch will attend over and hands them to the group.
+// Every non-owner writes them into its shared scratch cache at the very slots
+// the real block table resolves to, after which the ordinary prefill graph runs
+// identically on both roles. Chunked prefill and prefix-cache hits therefore
+// need no dedicated path: their history is just more slots in this list.
+//
+// This must run before the current chunk is written to the cache, otherwise a
+// history row landing in the same block would overwrite a fresh token.
+template <typename NormParamType>
+atb::Status AddLayerwisePrefillHistoryNodes(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    CHECK(param.isPrefill);
+    CHECK(param.reshapeCacheParm.kvCacheCfg ==
+          atb::infer::ReshapeAndCacheParam::KvCacheCfg::K_CACHE_V_CACHE)
+        << "Layerwise prefill history requires an ND key/value cache layout.";
+
+    auto addCacheGather = [&opGraph, &tensorMap](const std::string &cache,
+                                                 const std::string &out) -> atb::Status {
+        atb::Node gatherNode;
+        atb::infer::GatherParam gatherParam;
+        CHECK_OPERATION_STATUS_RETURN(
+            atb::CreateOperation(gatherParam, &gatherNode.operation));
+        gatherNode.inTensorIds = GetTensorIdxList(
+            tensorMap, {cache, "in_lw_history_slots"});
+        gatherNode.outTensorIds = GetTensorIdxList(tensorMap, {out});
+        gatherNode.inTensorReshapeFuncs.resize(gatherNode.inTensorIds.size());
+        gatherNode.inTensorReshapeFuncs[0] =
+            [](const atb::Dims &oldShape, atb::Dims &newShape) {
+                newShape.dimNum = 3;
+                newShape.dims[0] = oldShape.dims[0] * oldShape.dims[1];
+                newShape.dims[1] = oldShape.dims[2];
+                newShape.dims[2] = oldShape.dims[3];
+            };
+        opGraph.nodes.push_back(gatherNode);
+        return atb::NO_ERROR;
+    };
+
+    if (param.isDecodeDcpOwner) {
+        CHECK_OPERATION_STATUS_RETURN(
+            addCacheGather("in_k_cache", "lw_history_latent_local"));
+        CHECK_OPERATION_STATUS_RETURN(
+            addCacheGather("in_k_rope_cache", "lw_history_rope_local"));
+
+        atb::Node concatNode;
+        atb::infer::ConcatParam concatParam;
+        concatParam.concatDim = 2;
+        CHECK_OPERATION_STATUS_RETURN(
+            atb::CreateOperation(concatParam, &concatNode.operation));
+        concatNode.inTensorIds = GetTensorIdxList(
+            tensorMap, {"lw_history_latent_local", "lw_history_rope_local"});
+        concatNode.outTensorIds = GetTensorIdxList(tensorMap, {"lw_history_kv"});
+        opGraph.nodes.push_back(concatNode);
+
+        CHECK_OPERATION_STATUS_RETURN(
+            addCacheGather("in_k_cache_indexer", "lw_history_indexer"));
+    } else {
+        CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpCopyNode(
+            opGraph, tensorMap, "in_lw_history_kv_buffer", "lw_history_kv"));
+        CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpCopyNode(
+            opGraph, tensorMap, "in_lw_history_indexer_buffer",
+            "lw_history_indexer"));
+    }
+
+    CHECK_OPERATION_STATUS_RETURN(
+        AddDecodeDcpBroadcastNode(param, opGraph, tensorMap, "lw_history_kv"));
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpBroadcastNode(
+        param, opGraph, tensorMap, "lw_history_indexer"));
+    if (param.isDecodeDcpOwner) {
+        return atb::NO_ERROR;
+    }
+
+    atb::Node splitNode;
+    atb::infer::SplitParam splitParam = {
+        2, 2, {param.kvLoraRank, param.qkRopeHeadDim}};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(splitParam, &splitNode.operation));
+    splitNode.inTensorIds = GetTensorIdxList(tensorMap, {"lw_history_kv"});
+    splitNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"lw_history_latent", "lw_history_rope"});
+    opGraph.nodes.push_back(splitNode);
+
+    atb::Node kvScatterNode;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(param.reshapeCacheParm, &kvScatterNode.operation));
+    kvScatterNode.inTensorIds = GetTensorIdxList(tensorMap, {
+        "lw_history_latent", "lw_history_rope",
+        "in_k_cache", "in_k_rope_cache", "in_lw_history_slots"});
+    kvScatterNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"in_k_cache", "in_k_rope_cache"});
+    opGraph.nodes.push_back(kvScatterNode);
+
+    atb::Node indexerScatterNode;
+    atb::infer::ReshapeAndCacheParam indexerScatterParam;
+    indexerScatterParam.kvCacheCfg =
+        atb::infer::ReshapeAndCacheParam::KvCacheCfg::K_CACHE_V_BYPASS;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(
+        indexerScatterParam, &indexerScatterNode.operation));
+    indexerScatterNode.inTensorIds = GetTensorIdxList(tensorMap, {
+        "lw_history_indexer", "in_k_cache_indexer", "in_lw_history_slots"});
+    indexerScatterNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"in_k_cache_indexer"});
+    opGraph.nodes.push_back(indexerScatterNode);
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status PreprocessDecodeDcp(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    CHECK(!param.isPrefill);
+    // SparseFlashAttention reads the owner's local paged KV cache directly.
+    CHECK(param.reshapeCacheParm.kvCacheCfg ==
+          atb::infer::ReshapeAndCacheParam::KvCacheCfg::K_CACHE_V_CACHE)
+        << "Decode DCP requires an ND key/value cache layout.";
+
+    const bool useMlaPreprocess = param.qLoraRank > 0 && param.enableMlaPreprocess;
+    if (useMlaPreprocess) {
+        // The fused preprocess produces this rank's Q and writes the token's
+        // MLA cache in one node, so it cannot be split by ownership and both
+        // roles run it. A non-owner's write only updates its shared scratch;
+        // the owner runs attention against its persistent cache.
+        CHECK_OPERATION_STATUS_RETURN(AddMlaPreprocessV2Node(param, opGraph, tensorMap));
+    } else {
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnPreNormNode(param, opGraph, tensorMap));
+        if (param.qLoraRank > 0) {
+            CHECK_OPERATION_STATUS_RETURN(AddLAttnQKVProjNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddSplitQKNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddLAttnQProjBNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddSplitQNode(param, opGraph, tensorMap));
+        } else {
+            CHECK_OPERATION_STATUS_RETURN(AddLAttnQProjANode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddSplitQNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddLAttnKVAProjNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddSplitKNode(param, opGraph, tensorMap));
+        }
+
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnKVNormNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddLAttnRopeNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(PreprocessKV(param, opGraph, tensorMap));
+        if (param.isDecodeDcpOwner) {
+            CHECK_OPERATION_STATUS_RETURN(AddReshapeAndCacheNode(param, opGraph, tensorMap));
+        }
+    }
+
+    if (param.isDecodeDcpOwner) {
+        if (!param.skipTopk) {
+            if (!useMlaPreprocess) {
+                CHECK_OPERATION_STATUS_RETURN(AddLAttnQNormRecalNode(param, opGraph, tensorMap));
+            }
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerQBNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerQBSplitNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerInputNormRecalNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerKNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerKNormNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerKSplitNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerQKRopeNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerQKCatNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerKReshapeAndCacheNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddIndexerWeightNode(param, opGraph, tensorMap));
+            CHECK_OPERATION_STATUS_RETURN(AddLightIndexerNode(param, opGraph, tensorMap));
+        }
+    }
+
+    if (param.outputTopk) {
+        CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpTopkBroadcastNode(param, opGraph, tensorMap));
+    }
+    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpQAllGatherNodes(param, opGraph, tensorMap));
+    if (param.isDecodeDcpOwner) {
+        CHECK_OPERATION_STATUS_RETURN(
+            AddDecodeDcpQOwnerReorderNodes(param, opGraph, tensorMap));
+    }
+    return atb::NO_ERROR;
+}
+
 template <typename NormParamType>
 atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
     atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
 {   
+    if (param.enableDecodeDcpLayerOwner) {
+        return PreprocessDecodeDcp(param, opGraph, tensorMap);
+    }
+    if (param.enableLayerwisePrefillHistory && param.isPrefill) {
+        CHECK_OPERATION_STATUS_RETURN(
+            AddLayerwisePrefillHistoryNodes(param, opGraph, tensorMap));
+    }
     const bool useMlaPreprocess = param.qLoraRank > 0 && param.enableMlaPreprocess && !param.isPrefill;
     if (useMlaPreprocess) {
         CHECK_OPERATION_STATUS_RETURN(AddMlaPreprocessV2Node(param, opGraph, tensorMap));
@@ -2291,12 +2731,17 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
     // Preprocess
     CHECK_OPERATION_STATUS_RETURN(sparse::Preprocess(param, opGraph, tensorMap));
     // PA or MLA
-    
-    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
-    // CP Attention
+    if (param.enableDecodeDcpLayerOwner) {
+        if (param.isDecodeDcpOwner) {
+            CHECK_OPERATION_STATUS_RETURN(
+                sparse::AddSparseFlashAttentionNode(param, opGraph, tensorMap));
+        }
+        CHECK_OPERATION_STATUS_RETURN(
+            sparse::AddDecodeDcpOutputBroadcastNode(param, opGraph, tensorMap));
+    } else if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+        // CP Attention
         CHECK_OPERATION_STATUS_RETURN(sparse::AddSparseFlashAttentionCpNode(param, opGraph, tensorMap));
-    }
-    else {
+    } else {
         CHECK_OPERATION_STATUS_RETURN(sparse::AddSparseFlashAttentionNode(param, opGraph, tensorMap));
     }
     // CHECK_OPERATION_STATUS_RETURN(sparse::AddsfaTransposeNode(param, opGraph, tensorMap)); 
@@ -2322,13 +2767,23 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
             outTensorDescs.at(1).dtype = ACL_INT32;
             outTensorDescs.at(1).shape.dimNum = 3;
             outTensorDescs.at(1).shape.dims[0] = inTensorDescs.at(0).shape.dims[0];
-            outTensorDescs.at(1).shape.dims[1] = inTensorDescs.at(
-                atb_speed::common::GetTensorIdx(tensorMap, "in_k_cache_indexer")).shape.dims[2];
+            outTensorDescs.at(1).shape.dims[1] = 1;
             outTensorDescs.at(1).shape.dims[2] = param.index_topk;
         }
         return atb::NO_ERROR;
     };
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(opGraph, operation));
+    const atb::Status status = atb::CreateOperation(opGraph, operation);
+    if (status != atb::NO_ERROR) {
+        ATB_SPEED_LOG_ERROR("Failed to create SparseAttention graph, status=" << status
+            << ", isPrefill=" << param.isPrefill
+            << ", layerId=" << param.layerId
+            << ", isDecodeDcpOwner=" << param.isDecodeDcpOwner
+            << ", inTensorNum=" << opGraph.inTensorNum
+            << ", outTensorNum=" << opGraph.outTensorNum
+            << ", internalTensorNum=" << opGraph.internalTensorNum
+            << ", nodeNum=" << opGraph.nodes.size());
+        return status;
+    }
     return atb::NO_ERROR;
 }
 
