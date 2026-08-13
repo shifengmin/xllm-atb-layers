@@ -190,7 +190,7 @@ std::map<std::string, std::vector<std::string>> GetDeepseekV2LayerInTensorCandid
 	{"indexer_intensor", {
             "in_k_cache_indexer", "in_seq_len_query"}},
         {"topk_share", {
-            "in_shared_topk_indices"}}
+            "in_shared_topk_indices"}},
     };
     SetDeepseekV2LayerInTensorDefaultCandidates(deepseekV2LayerInTensorCandidates);
     return deepseekV2LayerInTensorCandidates;
@@ -468,6 +468,23 @@ void SetAttnKvSplitParam(
     }
 }
 
+void SetAttnLayerwiseSplitParam(
+    atb_speed::deepseekV2::LatentAttentionParam<atb::infer::RmsNormParam> &latentAttentionParam,
+    const DecoderLayerParam &param)
+{
+    if (!param.mapping.Has(base::ATTN_LAYERWISE_SPLIT)) {
+        return;
+    }
+    const atb_speed::common::ParallelInfo layerwiseSplitInfo =
+        param.mapping.Get(base::ATTN_LAYERWISE_SPLIT);
+    if (!layerwiseSplitInfo.IsEnabled()) {
+        return;
+    }
+    CHECK(!param.mapping.Get(base::ATTN_CP).IsEnabled())
+        << "Layerwise split does not support context parallel.";
+    latentAttentionParam.layerwiseSplitInfo = layerwiseSplitInfo;
+}
+
 void SetAttnInnerSpParam(
     atb_speed::deepseekV2::LatentAttentionParam<atb::infer::RmsNormParam> &latentAttentionParam,
     const DecoderLayerParam &param)
@@ -562,6 +579,7 @@ atb::Status SetLatentAttentionParam(
     // This function must be called after the pageAttentionParam is set. It will change pageAttentionParam.headNum
     SetAttnCpParam(latentAttentionParam, param);
     SetAttnKvSplitParam(latentAttentionParam, param);
+    SetAttnLayerwiseSplitParam(latentAttentionParam, param);
     SetAttnInnerSpParam(latentAttentionParam, param);
     SetLatentAttentionInnerCommParam(latentAttentionParam, param);
     latentAttentionParam.enableQkvdownDp = param.enableQkvdownDp && param.layerId > param.firstKDenseReplace;
@@ -2125,8 +2143,7 @@ atb::Status DecoderLayer(DecoderLayerParam &param, atb::Operation **operation)
             outTensorDescs.at(topkOutIdx).shape.dimNum = 3;
             outTensorDescs.at(topkOutIdx).shape.dims[0] = inTensorDescs.at(
                 atb_speed::common::GetTensorIdx(tensorMap, "in_hidden_states")).shape.dims[0];
-            outTensorDescs.at(topkOutIdx).shape.dims[1] = inTensorDescs.at(
-                atb_speed::common::GetTensorIdx(tensorMap, "in_k_cache_indexer")).shape.dims[2];
+            outTensorDescs.at(topkOutIdx).shape.dims[1] = 1;
             outTensorDescs.at(topkOutIdx).shape.dims[2] = param.index_topk;
         }
         return atb::NO_ERROR;

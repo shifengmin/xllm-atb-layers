@@ -62,6 +62,7 @@ enum ParallelType : uint32_t {
     MOE_EP,
     LCOC_ATTN_TP,
     ATTN_KV_SPLIT,
+    ATTN_LAYERWISE_SPLIT,
     PARALLEL_TYPE_END,
 };
 
