@@ -14,7 +14,12 @@ limitations under the License.
 ==============================================================================*/
 #include "operations/aclrt/ops/hccl_scatter_operation.h"
 
+#include <atomic>
+#include <cstdlib>
 #include <cstdint>
+#include <cstring>
+#include <sstream>
+#include <vector>
 
 #include <atb_speed/log.h>
 
@@ -149,12 +154,89 @@ atb::Status HcclScatterOperation::Execute(const atb::VariantPack &variant_pack, 
     if (data_type == HCCL_DATA_TYPE_RESERVED || recv_count == 0) {
         return atb::ERROR_INVALID_PARAM;
     }
+    static std::atomic<uint32_t> debug_count{0};
+    const char *debug_layout = std::getenv("XLLM_DEBUG_HCCL_SCATTER_LAYOUT");
+    const bool capture_layout = debug_layout != nullptr && debug_layout[0] == '1' &&
+                                debug_count.fetch_add(1) == 0;
+    const atb::Tensor &input_tensor = variant_pack.inTensors.at(0);
+    if (capture_layout) {
+        std::ostringstream input_shape;
+        for (uint32_t index = 0; index < input_tensor.desc.shape.dimNum; ++index) {
+            if (index != 0) {
+                input_shape << 'x';
+            }
+            input_shape << input_tensor.desc.shape.dims[index];
+        }
+        std::ostringstream output_shape;
+        for (uint32_t index = 0; index < output_tensor.desc.shape.dimNum; ++index) {
+            if (index != 0) {
+                output_shape << 'x';
+            }
+            output_shape << output_tensor.desc.shape.dims[index];
+        }
+        ATB_SPEED_LOG_ERROR(name_ << " layout rank=" << rank_ << "/" << rank_size_
+                                  << " root=" << rank_root_ << " input_ptr="
+                                  << input_tensor.deviceData << " output_ptr="
+                                  << output_tensor.deviceData << " input_bytes="
+                                  << input_tensor.dataSize << " output_bytes="
+                                  << output_tensor.dataSize << " input_shape="
+                                  << input_shape.str() << " output_shape="
+                                  << output_shape.str() << " input_dtype="
+                                  << input_tensor.desc.dtype << " output_dtype="
+                                  << output_tensor.desc.dtype << " stream="
+                                  << GetExecuteStream(context));
+    }
     const HcclResult result = HcclScatter(
         variant_pack.inTensors.at(0).deviceData, output_tensor.deviceData, recv_count, data_type,
         static_cast<uint32_t>(rank_root_), hccl_comm_, GetExecuteStream(context));
     if (result != HCCL_SUCCESS) {
         ATB_SPEED_LOG_ERROR(name_ << " HcclScatter failed, result=" << result);
         return atb::ERROR_INTERNAL_ERROR;
+    }
+    const char *debug_sync = std::getenv("XLLM_DEBUG_HCCL_SCATTER_SYNC");
+    if (debug_sync != nullptr && debug_sync[0] == '1' &&
+        aclrtSynchronizeStream(GetExecuteStream(context)) != ACL_SUCCESS) {
+        ATB_SPEED_LOG_ERROR(name_ << " debug stream synchronization failed");
+        return atb::ERROR_INTERNAL_ERROR;
+    }
+    if (capture_layout) {
+        void *gathered_data = nullptr;
+        if (input_tensor.dataSize != output_tensor.dataSize * static_cast<uint64_t>(rank_size_) ||
+            aclrtMalloc(&gathered_data, input_tensor.dataSize, ACL_MEM_MALLOC_HUGE_ONLY) != ACL_SUCCESS) {
+            ATB_SPEED_LOG_ERROR(name_ << " debug all-gather buffer setup failed");
+            return atb::ERROR_INTERNAL_ERROR;
+        }
+        const HcclResult gather_result = HcclAllGather(
+            output_tensor.deviceData, gathered_data, recv_count, data_type, hccl_comm_,
+            GetExecuteStream(context));
+        if (gather_result != HCCL_SUCCESS ||
+            aclrtSynchronizeStream(GetExecuteStream(context)) != ACL_SUCCESS) {
+            ATB_SPEED_LOG_ERROR(name_ << " debug all-gather failed, result=" << gather_result);
+            aclrtFree(gathered_data);
+            return atb::ERROR_INTERNAL_ERROR;
+        }
+        if (rank_ == rank_root_) {
+            std::vector<uint8_t> input_host(input_tensor.dataSize);
+            std::vector<uint8_t> gathered_host(input_tensor.dataSize);
+            const aclError input_copy_result = aclrtMemcpy(
+                input_host.data(), input_host.size(), input_tensor.deviceData,
+                input_tensor.dataSize, ACL_MEMCPY_DEVICE_TO_HOST);
+            const aclError gathered_copy_result = aclrtMemcpy(
+                gathered_host.data(), gathered_host.size(), gathered_data,
+                input_tensor.dataSize, ACL_MEMCPY_DEVICE_TO_HOST);
+            if (input_copy_result != ACL_SUCCESS || gathered_copy_result != ACL_SUCCESS) {
+                ATB_SPEED_LOG_ERROR(name_ << " debug host copy failed, input=" << input_copy_result
+                                          << " gathered=" << gathered_copy_result);
+                aclrtFree(gathered_data);
+                return atb::ERROR_INTERNAL_ERROR;
+            }
+            const bool matches = std::memcmp(input_host.data(), gathered_host.data(),
+                                             input_host.size()) == 0;
+            ATB_SPEED_LOG_ERROR(name_ << " debug rank-major round trip "
+                                      << (matches ? "PASS" : "FAIL")
+                                      << ", bytes=" << input_host.size());
+        }
+        aclrtFree(gathered_data);
     }
     return atb::NO_ERROR;
 }

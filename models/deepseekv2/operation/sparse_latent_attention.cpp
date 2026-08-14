@@ -15,6 +15,7 @@
  */
 
 #include "atb_speed/base/model.h"
+#include "atb_speed/utils/singleton.h"
 #include "operations/fusion/utils.h"
 #include "operations/aclrt/ops/aclrt_cmo_async.h"
 #include "operations/aclrt/ops/hccl_scatter_operation.h"
@@ -2160,6 +2161,12 @@ atb::Status AddDecodeDcpOutputScatterNode(
     scatterNode.operation = new atb_speed::common::HcclScatterOperation(
         "DecodeDcpOutputScatter", static_cast<int32_t>(param.decodeDcpInfo.rank),
         rank_size, param.decodeDcpOwnerRank, hccl_comm);
+    // Keep the raw HCCL call on the same ATB stream selected for this DAP
+    // communication phase. The communicator domain is keyed by this stream
+    // id, so using the default stream here would break stream-local ordering.
+    CHECK_OPERATION_STATUS_RETURN(atb::SetExecuteStreamId(
+        scatterNode.operation,
+        atb_speed::GetSingleton<atb_speed::common::DapManager>().GetStreamId()));
     scatterNode.inTensorIds = GetTensorIdxList(tensorMap, {scatter_input});
     if (!param.isDecodeDcpOwner) {
         scatterNode.inTensorReshapeFuncs.resize(scatterNode.inTensorIds.size());
