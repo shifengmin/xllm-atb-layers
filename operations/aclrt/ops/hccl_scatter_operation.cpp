@@ -122,11 +122,25 @@ atb::Status HcclScatterOperation::Setup(const atb::VariantPack &variant_pack,
 }
 
 atb::Status HcclScatterOperation::Execute(const atb::VariantPack &variant_pack, uint8_t *,
-                                          uint64_t workspace_size, atb::Context *context)
+                                          uint64_t, atb::Context *context)
 {
-    if (context == nullptr || workspace_size != 0 || variant_pack.inTensors.size() != 1 ||
-        variant_pack.outTensors.size() != 1 || variant_pack.inTensors.at(0).deviceData == nullptr ||
-        variant_pack.outTensors.at(0).deviceData == nullptr || hccl_comm_ == nullptr) {
+    if (context == nullptr) {
+        ATB_SPEED_LOG_ERROR(name_ << " execute context is null");
+        return atb::ERROR_INVALID_PARAM;
+    }
+    if (variant_pack.inTensors.size() != 1 || variant_pack.outTensors.size() != 1) {
+        ATB_SPEED_LOG_ERROR(name_ << " invalid tensor count, inputs="
+                                  << variant_pack.inTensors.size() << ", outputs="
+                                  << variant_pack.outTensors.size());
+        return atb::ERROR_INVALID_PARAM;
+    }
+    if (variant_pack.inTensors.at(0).deviceData == nullptr ||
+        variant_pack.outTensors.at(0).deviceData == nullptr) {
+        ATB_SPEED_LOG_ERROR(name_ << " input or output device data is null");
+        return atb::ERROR_INVALID_PARAM;
+    }
+    if (hccl_comm_ == nullptr) {
+        ATB_SPEED_LOG_ERROR(name_ << " HCCL communicator is null");
         return atb::ERROR_INVALID_PARAM;
     }
     const atb::Tensor &output_tensor = variant_pack.outTensors.at(0);
