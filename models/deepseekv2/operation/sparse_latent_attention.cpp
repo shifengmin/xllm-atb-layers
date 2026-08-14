@@ -17,6 +17,7 @@
 #include "atb_speed/base/model.h"
 #include "operations/fusion/utils.h"
 #include "operations/aclrt/ops/aclrt_cmo_async.h"
+#include "operations/aclrt/ops/hccl_scatter_operation.h"
 #include "operations/aclnn/ops/aclnn_rope_operation.h"
 #include "operations/aclnn/ops/concat_operation.h"
 #include "operations/aclnn/ops/split_with_size_operation.h"
@@ -245,13 +246,13 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
             "prefix_indexer_k_allgather"
         }},
         {"decode_dcp", {
-            "dcp_q_packed_local", "dcp_q_packed_rank_major",
-            "dcp_attention_output"
+            "dcp_q_packed_local", "dcp_q_packed_rank_major"
         }},
         {"decode_dcp_topk", {"dcp_shared_topk"}},
         {"decode_dcp_owner", {
             "dcp_q_packed_token_major", "dcp_q_nope_owner",
-            "dcp_q_rope_owner", "dcp_attention_output_owner"
+            "dcp_q_rope_owner", "dcp_attention_output_owner",
+            "dcp_attention_output_rank_major"
         }},
         {"decode_dcp_owner_topk", {"dcp_raw_topk"}},
         {"layerwise_prefill", {"lw_history_kv"}},
@@ -2114,34 +2115,72 @@ atb::Status AddDecodeDcpQOwnerReorderNodes(
 }
 
 template <typename NormParamType>
-atb::Status AddDecodeDcpOutputBroadcastNode(
+atb::Status AddDecodeDcpOutputScatterNode(
     const LatentAttentionParam<NormParamType> &param,
     atb::GraphParam &opGraph,
     std::map<std::string, uint32_t> &tensorMap)
 {
-    const std::string source = param.isDecodeDcpOwner
-        ? "dcp_attention_output_owner"
-        : "in_dcp_attention_output_buffer";
-    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpCopyNode(
-        opGraph, tensorMap, source, "dcp_attention_output"));
-    CHECK_OPERATION_STATUS_RETURN(AddDecodeDcpBroadcastNode(
-        param, opGraph, tensorMap, "dcp_attention_output"));
+    const int32_t rank_size = static_cast<int32_t>(param.decodeDcpInfo.rankIds.size());
+    HcclComm hccl_comm = nullptr;
+    std::string comm_domain;
+    param.decodeDcpInfo.InitCommDomain(hccl_comm, comm_domain);
 
-    atb::Node sliceNode;
-    atb::infer::SliceParam sliceParam;
-    sliceParam.offsets = {
-        0,
-        static_cast<int64_t>(param.decodeDcpInfo.rank) *
-            param.selfAttentionParam.headNum,
-        0};
-    sliceParam.size = {-1, param.selfAttentionParam.headNum, -1};
-    CHECK_OPERATION_STATUS_RETURN(
-        atb::CreateOperation(sliceParam, &sliceNode.operation));
-    sliceNode.inTensorIds = GetTensorIdxList(
-        tensorMap, {"dcp_attention_output"});
-    sliceNode.outTensorIds = GetTensorIdxList(
+    std::string scatter_input = "in_dcp_attention_output_buffer";
+    if (param.isDecodeDcpOwner) {
+        // HCCL Scatter splits a flat buffer by rank. Reorder the owner output
+        // from [T, dcp*H, D] to [dcp, T, H, D] so every rank receives one
+        // complete head shard, including multi-token MTP decode.
+        atb::Node reorderNode;
+        atb::infer::TransposeParam reorderParam;
+        reorderParam.perm = {1, 0, 2, 3};
+        CHECK_OPERATION_STATUS_RETURN(
+            atb::CreateOperation(reorderParam, &reorderNode.operation));
+        reorderNode.inTensorIds = GetTensorIdxList(
+            tensorMap, {"dcp_attention_output_owner"});
+        reorderNode.outTensorIds = GetTensorIdxList(
+            tensorMap, {"dcp_attention_output_rank_major"});
+        reorderNode.inTensorReshapeFuncs.resize(reorderNode.inTensorIds.size());
+        reorderNode.inTensorReshapeFuncs[0] = [rank_size](const atb::Dims &old_shape,
+                                                          atb::Dims &new_shape) {
+            if (old_shape.dimNum != 3 || old_shape.dims[1] <= 0 ||
+                old_shape.dims[1] % rank_size != 0) {
+                return;
+            }
+            new_shape.dimNum = 4;
+            new_shape.dims[0] = old_shape.dims[0];
+            new_shape.dims[1] = rank_size;
+            new_shape.dims[2] = old_shape.dims[1] / rank_size;
+            new_shape.dims[3] = old_shape.dims[2];
+        };
+        opGraph.nodes.push_back(reorderNode);
+        scatter_input = "dcp_attention_output_rank_major";
+    }
+
+    atb::Node scatterNode;
+    scatterNode.operation = new atb_speed::common::HcclScatterOperation(
+        "DecodeDcpOutputScatter", static_cast<int32_t>(param.decodeDcpInfo.rank),
+        rank_size, param.decodeDcpOwnerRank, hccl_comm);
+    scatterNode.inTensorIds = GetTensorIdxList(tensorMap, {scatter_input});
+    if (!param.isDecodeDcpOwner) {
+        scatterNode.inTensorReshapeFuncs.resize(scatterNode.inTensorIds.size());
+        scatterNode.inTensorReshapeFuncs[0] = [rank_size](const atb::Dims &old_shape,
+                                                          atb::Dims &new_shape) {
+            if (old_shape.dimNum != 3 || old_shape.dims[1] <= 0 ||
+                old_shape.dims[1] % rank_size != 0) {
+                return;
+            }
+            new_shape.dimNum = 4;
+            new_shape.dims[0] = rank_size;
+            new_shape.dims[1] = old_shape.dims[0];
+            new_shape.dims[2] = old_shape.dims[1] / rank_size;
+            new_shape.dims[3] = old_shape.dims[2];
+        };
+    }
+    scatterNode.outTensorIds = GetTensorIdxList(
         tensorMap, {"intermediate_self_attention"});
-    opGraph.nodes.push_back(sliceNode);
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsBeforeComm(opGraph));
+    opGraph.nodes.push_back(scatterNode);
+    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsAfterComm(opGraph));
     return atb::NO_ERROR;
 }
 
@@ -2753,7 +2792,7 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
                 sparse::AddSparseFlashAttentionNode(param, opGraph, tensorMap));
         }
         CHECK_OPERATION_STATUS_RETURN(
-            sparse::AddDecodeDcpOutputBroadcastNode(param, opGraph, tensorMap));
+            sparse::AddDecodeDcpOutputScatterNode(param, opGraph, tensorMap));
     } else if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
         // CP Attention
         CHECK_OPERATION_STATUS_RETURN(sparse::AddSparseFlashAttentionCpNode(param, opGraph, tensorMap));
