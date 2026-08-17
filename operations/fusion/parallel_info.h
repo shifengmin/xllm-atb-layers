@@ -35,7 +35,8 @@ struct ParallelInfo {
     uint32_t bufferSize = 0;
 
     /// Initialize hccl communication handle on demand and get unique communication domain from rankIds
-    void InitCommDomain(HcclComm& hcclComm, std::string& commDomain, std::string backend = "") const;
+    void InitCommDomain(HcclComm& hcclComm, std::string& commDomain,
+        std::string backend = "", uint32_t reuseKey = 0) const;
     /// Check if the parallel strategy is enabled
     bool IsEnabled() const;
     /// A summary of the `ParallelInfo` object

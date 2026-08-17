@@ -46,7 +46,8 @@ std::string InitCommBackend(uint32_t localWorldSize, const std::vector<uint32_t>
     return backend;
 }
 
-void ParallelInfo::InitCommDomain(HcclComm& hcclComm, std::string& commDomain, std::string backend) const
+void ParallelInfo::InitCommDomain(HcclComm& hcclComm, std::string& commDomain,
+    std::string backend, uint32_t reuseKey) const
 {
     if (backend == "") {
         backend = this->defaultBackend;
@@ -56,7 +57,8 @@ void ParallelInfo::InitCommDomain(HcclComm& hcclComm, std::string& commDomain, s
 
     // Assign commDomain by rankIds and rank
     commDomain = GetSingleton<ExternalCommManager>().GetCommDomain(
-        this->groupId, this->rankIds, this->rank, backend, this->bufferSize, streamId);
+        this->groupId, this->rankIds, this->rank, backend, this->bufferSize,
+        streamId, true, reuseKey);
     // Get hcclComm (only created when hccl backend is used and inference across multi nodes)
     hcclComm = GetSingleton<ExternalCommManager>().GetCommPtr(commDomain);
 

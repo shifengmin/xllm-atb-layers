@@ -41,6 +41,8 @@ namespace sparse {
 constexpr uint64_t INDEXER_WQ_B_LINEAR_INDEX = 6;
 constexpr uint64_t INDEXER_WK_LINEAR_INDEX = 7;
 constexpr uint64_t INDEXER_PROJ_LINEAR_INDEX = 8;
+constexpr uint32_t kDecodeDcpScatterBufferSizeMb = 8;
+constexpr uint32_t kDecodeDcpScatterReuseKeyBase = 1;
 
 bool UseAttnLinearDesc(const std::vector<int> &attnLinearQuantType)
 {
@@ -2124,7 +2126,14 @@ atb::Status AddDecodeDcpOutputScatterNode(
     const int32_t rank_size = static_cast<int32_t>(param.decodeDcpInfo.rankIds.size());
     HcclComm hccl_comm = nullptr;
     std::string comm_domain;
-    param.decodeDcpInfo.InitCommDomain(hccl_comm, comm_domain);
+    // HCCL caches the first Scatter root in a communicator. Keep one cached
+    // communicator per root, using a small buffer sized for decode payloads.
+    atb_speed::common::ParallelInfo scatter_info = param.decodeDcpInfo;
+    scatter_info.bufferSize = kDecodeDcpScatterBufferSizeMb;
+    scatter_info.InitCommDomain(
+        hccl_comm, comm_domain, "",
+        kDecodeDcpScatterReuseKeyBase +
+            static_cast<uint32_t>(param.decodeDcpOwnerRank));
 
     std::string scatter_input = "in_dcp_attention_output_buffer";
     if (param.isDecodeDcpOwner) {

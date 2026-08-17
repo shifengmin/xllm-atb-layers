@@ -40,6 +40,7 @@ public:
     HcclComm hcclComm_ = nullptr;
     uint32_t bufferSize_ = 0;
     uint32_t streamId_ = 0;
+    uint32_t reuseKey_ = 0;
     bool enableReuse_ = true;
 
     std::string ToString() const;
@@ -55,7 +56,7 @@ public:
 
     std::string GetCommDomain(uint32_t groupId, const std::vector<uint32_t> &rankIds,
         uint32_t subCommRankId, std::string backend, uint32_t bufferSize, uint32_t streamId,
-        bool enableReuse = true);
+        bool enableReuse = true, uint32_t reuseKey = 0);
 
     HcclComm GetCommPtr(std::string commDomain);
 
@@ -67,7 +68,8 @@ public:
 
 private:
     std::string GetCommDomainFromCache(
-        const std::vector<uint32_t> &rankIds, std::string backend, uint32_t bufferSize, uint32_t streamId);
+        const std::vector<uint32_t> &rankIds, std::string backend, uint32_t bufferSize,
+        uint32_t streamId, uint32_t reuseKey);
     std::string GetSelfAssignedCommDomain(std::shared_ptr<CommInfo> &commInfo, uint32_t groupId);
     std::string GetHcclSubCommDomain(std::shared_ptr<CommInfo> &commInfo, uint32_t groupId);
     std::string GetHcclGlobalCommDomain(std::shared_ptr<CommInfo> &commInfo);
