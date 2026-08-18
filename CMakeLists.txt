@@ -31,7 +31,6 @@ cc_library(
     gflags::gflags
     spdlog::spdlog
     triton_adapter
-    atb
 )
 
 target_include_directories(xllm_atb_layers PUBLIC
