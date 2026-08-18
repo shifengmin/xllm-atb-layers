@@ -67,6 +67,7 @@ struct LatentAttentionParam {
     int index_topk = 0; // 2048
     bool skipTopk = false;
     bool outputTopk = false;
+    atb_speed::common::ParallelInfo layerwiseSplitInfo;
 
     int packQuantType = atb_speed::common::PackQuantType::ALL_FP;
     // Compatibility vector: entries may be legacy LinearType or new LinearDesc.
