@@ -468,18 +468,21 @@ void SetAttnKvSplitParam(
     }
 }
 
+bool LayerwiseSplitEnabled(const DecoderLayerParam &param)
+{
+    return param.mapping.Has(base::ATTN_LAYERWISE_SPLIT) &&
+        param.mapping.Get(base::ATTN_LAYERWISE_SPLIT).IsEnabled();
+}
+
 void SetAttnLayerwiseSplitParam(
     atb_speed::deepseekV2::LatentAttentionParam<atb::infer::RmsNormParam> &latentAttentionParam,
     const DecoderLayerParam &param)
 {
-    if (!param.mapping.Has(base::ATTN_LAYERWISE_SPLIT)) {
+    if (!LayerwiseSplitEnabled(param)) {
         return;
     }
     const atb_speed::common::ParallelInfo layerwiseSplitInfo =
         param.mapping.Get(base::ATTN_LAYERWISE_SPLIT);
-    if (!layerwiseSplitInfo.IsEnabled()) {
-        return;
-    }
     CHECK(!param.mapping.Get(base::ATTN_CP).IsEnabled())
         << "Layerwise split does not support context parallel.";
     latentAttentionParam.layerwiseSplitInfo = layerwiseSplitInfo;
@@ -2143,7 +2146,12 @@ atb::Status DecoderLayer(DecoderLayerParam &param, atb::Operation **operation)
             outTensorDescs.at(topkOutIdx).shape.dimNum = 3;
             outTensorDescs.at(topkOutIdx).shape.dims[0] = inTensorDescs.at(
                 atb_speed::common::GetTensorIdx(tensorMap, "in_hidden_states")).shape.dims[0];
-            outTensorDescs.at(topkOutIdx).shape.dims[1] = 1;
+            if (LayerwiseSplitEnabled(param)) {
+                outTensorDescs.at(topkOutIdx).shape.dims[1] = 1;
+            } else {
+                outTensorDescs.at(topkOutIdx).shape.dims[1] = inTensorDescs.at(
+                    atb_speed::common::GetTensorIdx(tensorMap, "in_k_cache_indexer")).shape.dims[2];
+            }
             outTensorDescs.at(topkOutIdx).shape.dims[2] = param.index_topk;
         }
         return atb::NO_ERROR;

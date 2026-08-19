@@ -1938,7 +1938,9 @@ atb::Status AddLightIndexerNode(const LatentAttentionParam<NormParamType> &param
 {
     atb::Node lightIndexerNode;
     atb_speed::common::LightningIndexerParam lightIndexerParam;
-    lightIndexerParam.selectedCount = param.index_topk;
+    if (LayerwiseSplitEnabled(param)) {
+        lightIndexerParam.selectedCount = param.index_topk;
+    }
     lightIndexerNode.operation = new atb_speed::common::LightningIndexerOperation(
         "AclNNLightningIndexerNode", lightIndexerParam
     );
@@ -2597,7 +2599,12 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
             outTensorDescs.at(1).dtype = ACL_INT32;
             outTensorDescs.at(1).shape.dimNum = 3;
             outTensorDescs.at(1).shape.dims[0] = inTensorDescs.at(0).shape.dims[0];
-            outTensorDescs.at(1).shape.dims[1] = 1;
+            if (sparse::LayerwiseSplitEnabled(param)) {
+                outTensorDescs.at(1).shape.dims[1] = 1;
+            } else {
+                outTensorDescs.at(1).shape.dims[1] = inTensorDescs.at(
+                    atb_speed::common::GetTensorIdx(tensorMap, "in_k_cache_indexer")).shape.dims[2];
+            }
             outTensorDescs.at(1).shape.dims[2] = param.index_topk;
         }
         return atb::NO_ERROR;
