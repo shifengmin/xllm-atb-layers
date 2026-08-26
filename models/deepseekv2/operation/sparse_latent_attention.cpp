@@ -21,6 +21,7 @@
 #include "operations/aclnn/ops/concat_operation.h"
 #include "operations/aclnn/ops/split_with_size_operation.h"
 #include "operations/aclnn/ops/repeat_operation.h"
+#include "operations/aclnn/ops/cast_operation.h"
 #include "operations/aclnn/ops/lightning_indexer_operation.h"
 #include "operations/aclnn/ops/sparse_flash_attention_operation.h"
 #include "operations/aclnn/ops/mla_preprocess_v2_operation.h"
@@ -288,6 +289,9 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
             "layerwise_split_q_packed_token_major", "layerwise_split_q_nope_owner",
             "layerwise_split_q_rope_owner"
         }},
+        {"layerwise_split_topk_dummy", {
+            "layerwise_split_topk_dummy_slice"
+        }},
     };
     return latentAttnIntermediateTensorCandidates;
 }
@@ -362,6 +366,11 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
         if (!param.outputTopk) {
             intermediateTensorList.push_back("intermediate_topk_indices");
         }
+    } else if (param.skipTopk && LayerwiseSplitEnabled(param) && IsLayerwiseSplitOwner(param)) {
+        // Owner SFA still needs an internal top-k tensor. Copy the shared
+        // input into this buffer in Preprocess so the skipTopk × owner graph
+        // has the same SparseFlashAttention closure as a full-attn owner.
+        intermediateTensorList.push_back("intermediate_topk_indices");
     }
     if (param.skipTopk) {
         AddTensorToList(latentAttnInTensorCandidates, "topk_share", inTensorList);
@@ -371,6 +380,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
         if (IsLayerwiseSplitOwner(param)) {
             AddTensorToList(latentAttnIntermediateTensorCandidates,
                 "layerwise_split_owner", intermediateTensorList);
+        } else if (param.outputTopk) {
+            AddTensorToList(latentAttnIntermediateTensorCandidates,
+                "layerwise_split_topk_dummy", intermediateTensorList);
         }
     }
     AddTensorToList(latentAttnIntermediateTensorCandidates, "ein_reproj", intermediateTensorList);
@@ -2005,6 +2017,44 @@ atb::Status AddLayerwiseSplitBroadcastNode(
     return atb::NO_ERROR;
 }
 
+// Non-owner never runs the indexer, so out_topk_indices has no producer.
+// InferShape is [T, 1, index_topk] with T = in_input.dims[0]. Slice hidden
+// to that shape then AclNN-cast to INT32 (ATB Repeat/ELEWISE_CAST reject
+// this dtype pair). Dummy values are overwritten by Broadcast.
+template <typename NormParamType>
+atb::Status AddLayerwiseSplitDummyTopkNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    CHECK_OPERATION_STATUS_RETURN(AddLayerwiseSplitSliceAllocNode(
+        opGraph,
+        tensorMap,
+        "in_input",
+        "layerwise_split_topk_dummy_slice",
+        static_cast<int64_t>(param.index_topk),
+        [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+            CHECK_GE(oldShape.dimNum, 2);
+            const int64_t lastDim = oldShape.dims[oldShape.dimNum - 1];
+            CHECK_GE(lastDim, static_cast<int64_t>(param.index_topk));
+            newShape.dimNum = 3;
+            newShape.dims[0] = oldShape.dims[0];
+            newShape.dims[1] = 1;
+            newShape.dims[2] = lastDim;
+        }));
+    atb::Node castNode;
+    atb_speed::common::AclNNCastParam castParam;
+    castParam.dtype = ACL_INT32;
+    castNode.operation = new atb_speed::common::CastOperation(
+        "LayerwiseSplitDummyTopkCast", castParam);
+    castNode.inTensorIds = GetTensorIdxList(
+        tensorMap, {"layerwise_split_topk_dummy_slice"});
+    castNode.outTensorIds = GetTensorIdxList(
+        tensorMap, {"out_topk_indices"});
+    opGraph.nodes.push_back(castNode);
+    return atb::NO_ERROR;
+}
+
 template <typename NormParamType>
 atb::Status AddLayerwiseSplitQAllGatherNodes(
     const LatentAttentionParam<NormParamType> &param,
@@ -2090,6 +2140,35 @@ atb::Status AddLayerwiseSplitQOwnerReorderNodes(
     return atb::NO_ERROR;
 }
 
+// Copy graph-input shared top-k into an internal so owner SFA consumes the
+// same tensor category as a full-attn owner (query + sparse indices are both
+// internals). Non-layerwise skipTopk keeps feeding in_shared_topk_indices.
+template <typename NormParamType>
+atb::Status AddLayerwiseSplitSharedTopkCopyNode(
+    const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    CHECK(param.skipTopk);
+    CHECK(IsLayerwiseSplitOwner(param));
+    atb::Node sliceNode;
+    atb::infer::SliceParam sliceParam;
+    sliceParam.offsets = {0, 0, 0};
+    sliceParam.size = {-1, -1, -1};
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(sliceParam, &sliceNode.operation));
+    sliceNode.inTensorIds = GetTensorIdxList(tensorMap, {"in_shared_topk_indices"});
+    sliceNode.outTensorIds = GetTensorIdxList(tensorMap, {"intermediate_topk_indices"});
+    if (sliceNode.inTensorIds.at(0) == UINT32_MAX ||
+        sliceNode.outTensorIds.at(0) == UINT32_MAX) {
+        ATB_SPEED_LOG_ERROR(
+            "Layerwise skipTopk owner is missing shared top-k tensors");
+        return atb::ERROR_INVALID_PARAM;
+    }
+    opGraph.nodes.push_back(sliceNode);
+    return atb::NO_ERROR;
+}
+
 template <typename NormParamType>
 atb::Status AddLayerwiseSplitOutputBroadcastNode(
     const LatentAttentionParam<NormParamType> &param,
@@ -2163,10 +2242,12 @@ atb::Status AddSparseFlashAttentionNode(
         q_nope = "intermediate_q_nope";
         q_pe = "intermediate_q_rope";
     }
-    std::string topk_indices =
-        param.skipTopk ? "in_shared_topk_indices"
-                       : (param.outputTopk ? "out_topk_indices"
-                                           : "intermediate_topk_indices");
+    std::string topk_indices = "intermediate_topk_indices";
+    if (param.skipTopk && !LayerwiseSplitEnabled(param)) {
+        topk_indices = "in_shared_topk_indices";
+    } else if (!param.skipTopk && param.outputTopk) {
+        topk_indices = "out_topk_indices";
+    }
     sparseFlashAttentionNode.inTensorIds = {
         GetTensorIdx(tensorMap, q_nope),
         GetTensorIdx(tensorMap, "in_k_cache"),
@@ -2178,6 +2259,16 @@ atb::Status AddSparseFlashAttentionNode(
         GetTensorIdx(tensorMap, q_pe),
         GetTensorIdx(tensorMap, "in_k_rope_cache"),
     };
+    for (size_t i = 0; i < sparseFlashAttentionNode.inTensorIds.size(); ++i) {
+        if (sparseFlashAttentionNode.inTensorIds.at(i) == UINT32_MAX) {
+            ATB_SPEED_LOG_ERROR("SparseFlashAttention inTensor[" << i
+                << "] is missing, q_nope=" << q_nope
+                << ", q_pe=" << q_pe
+                << ", topk=" << topk_indices
+                << ", skipTopk=" << param.skipTopk);
+            return atb::ERROR_INVALID_PARAM;
+        }
+    }
     const std::string output = LayerwiseSplitEnabled(param)
         ? "layerwise_split_attention_output"
         : "intermediate_self_attention";
@@ -2534,8 +2625,16 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
     }
     if (layerwiseSplit) {
         if (param.outputTopk) {
+            if (!isLayerwiseSplitOwner) {
+                CHECK_OPERATION_STATUS_RETURN(AddLayerwiseSplitDummyTopkNode(
+                    param, opGraph, tensorMap));
+            }
             CHECK_OPERATION_STATUS_RETURN(AddLayerwiseSplitBroadcastNode(
                 param, opGraph, tensorMap, "out_topk_indices"));
+        }
+        if (param.skipTopk && isLayerwiseSplitOwner) {
+            CHECK_OPERATION_STATUS_RETURN(
+                AddLayerwiseSplitSharedTopkCopyNode(param, opGraph, tensorMap));
         }
         CHECK_OPERATION_STATUS_RETURN(
             AddLayerwiseSplitQAllGatherNodes(param, opGraph, tensorMap));
